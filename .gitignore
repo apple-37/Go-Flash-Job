@@ -1,0 +1,10 @@
+# 文件: .gitignore
+
+# 忽略所有配置文件
+configs/*.yaml
+# 但是不忽略模板文件
+!configs/*.example.yaml
+
+# 忽略编译产物
+*.exe
+go-flash-job

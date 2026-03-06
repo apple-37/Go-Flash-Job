@@ -1,0 +1,19 @@
+# 文件: configs/config.example.yaml
+
+server:
+  port: ":8080"
+
+mysql:
+  dsn: "user:password@tcp(127.0.0.1:3306)/go_flash_job?charset=utf8mb4&parseTime=True&loc=Local"
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+
+kafka:
+  brokers:
+    - "127.0.0.1:9092"
+
+rabbitmq:
+  url: "amqp://user:password@localhost:5672/"
