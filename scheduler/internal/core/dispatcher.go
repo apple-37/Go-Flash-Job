@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ type Task struct {
 	JobID       string
 	TriggerTime int64 // 触发时间戳（秒）
 	RetryCount  int
+	Priority    string // 优先级: High, Medium, Low
 }
 
 // TaskCommand 是推送到 MQ 的任务消息体。
@@ -44,7 +46,17 @@ type TaskCommand struct {
 type TaskHeap []*Task
 
 func (h TaskHeap) Len() int           { return len(h) }
-func (h TaskHeap) Less(i, j int) bool { return h[i].TriggerTime < h[j].TriggerTime }
+func (h TaskHeap) Less(i, j int) bool {
+	// 首先按优先级排序
+	priorityMap := map[string]int{"High": 3, "Medium": 2, "Low": 1}
+	priI := priorityMap[h[i].Priority]
+	priJ := priorityMap[h[j].Priority]
+	if priI != priJ {
+		return priI > priJ
+	}
+	// 优先级相同时按触发时间排序
+	return h[i].TriggerTime < h[j].TriggerTime
+}
 func (h TaskHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *TaskHeap) Push(x interface{}) {
 	*h = append(*h, x.(*Task))
@@ -144,15 +156,26 @@ func (d *Dispatcher) fetcherLoop(ctx context.Context) {
 
 		d.mu.Lock()
 		for i := 0; i < len(result); i += 2 {
-			jobID := result[i]
+			jobIDWithPriority := result[i]
 			triggerTime, parseErr := strconv.ParseInt(result[i+1], 10, 64)
 			if parseErr != nil {
-				log.Printf("⚠️ triggerTime 解析失败, job=%s score=%s err=%v", jobID, result[i+1], parseErr)
+				log.Printf("⚠️ triggerTime 解析失败, job=%s score=%s err=%v", jobIDWithPriority, result[i+1], parseErr)
 				continue
 			}
+			
+			// 解析任务ID和优先级
+			parts := strings.Split(jobIDWithPriority, "_")
+			priority := "Low" // 默认优先级
+			
+			// 如果格式是 "job_[ID]_[Priority]"，则提取优先级
+			if len(parts) >= 3 {
+				priority = parts[len(parts)-1]
+			}
+			
 			heap.Push(&d.localQueue, &Task{
-				JobID:       jobID,
+				JobID:       jobIDWithPriority,
 				TriggerTime: triggerTime,
+				Priority:    priority,
 			})
 		}
 		d.mu.Unlock()
@@ -232,6 +255,9 @@ func (d *Dispatcher) executorLoop(ctx context.Context) {
 				continue
 			}
 
+			// 注意：这里需要使用原始的jobIDWithPriority来移除pending任务
+			// 因为我们在添加任务时使用的是包含优先级的ID
+			// 但为了简化，我们假设JobID字段已经包含了完整的ID（包括优先级）
 			if _, err := database.RDB.ZRem(ctx, consts.JobPendingZSetKey, taskToRun.JobID).Result(); err != nil {
 				log.Printf("⚠️ 任务 %s 已投递 MQ 但 pending 移除失败: %v", taskToRun.JobID, err)
 			}

@@ -15,6 +15,7 @@ import (
 	"go-flash-job/pkg/mq"
 	"go-flash-job/scheduler/internal/api"
 	"go-flash-job/scheduler/internal/core"
+	"go-flash-job/scheduler/internal/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -41,7 +42,15 @@ func main() {
 	dispatcher := core.NewDispatcher()
 	dispatcher.Start(ctx)
 
-	// 4. 启动 HTTP API Server (不变)
+	// 4. 从/data目录加载任务文件
+	jobService := service.NewJobService()
+	if err := jobService.LoadJobsFromFiles(ctx); err != nil {
+		log.Printf("⚠️ 从/data目录加载任务文件失败: %v", err)
+	} else {
+		log.Println("✅ 成功从/data目录加载任务文件")
+	}
+
+	// 5. 启动 HTTP API Server (不变)
 	r := gin.Default()
 	api.RegisterRoutes(r)
 
