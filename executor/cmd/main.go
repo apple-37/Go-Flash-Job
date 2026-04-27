@@ -3,7 +3,7 @@ package main
 
 import (
 	"fmt"
-	"go-flash-job/internal/executor/client"
+	"go-flash-job/executor/internal/client"
 	"go-flash-job/pkg/config" // 引入 config
 	"go-flash-job/pkg/mq"
 )

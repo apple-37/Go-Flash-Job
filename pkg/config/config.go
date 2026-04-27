@@ -2,6 +2,7 @@ package config
 
 import (
 	"log"
+
 	"github.com/spf13/viper"
 )
 
@@ -37,7 +38,10 @@ var AppConfig Config
 func InitConfig() {
 	viper.SetConfigName("config") // 配置文件名 (不带扩展名)
 	viper.SetConfigType("yaml") // 配置文件类型
-	viper.AddConfigPath("./configs") // 配置文件路径
+	viper.AddConfigPath(".")
+	viper.AddConfigPath("./configs")
+	viper.AddConfigPath("..")
+	viper.AddConfigPath("../..")
 
 	if err := viper.ReadInConfig(); err != nil {
 		log.Fatalf("❌ 读取配置文件失败: %v", err)

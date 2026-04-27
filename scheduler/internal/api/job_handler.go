@@ -4,8 +4,9 @@ import (
 	"net/http"
 	"strconv"
 
+	"go-flash-job/scheduler/internal/service"
+
 	"github.com/gin-gonic/gin"
-	"go-flash-job/internal/scheduler/service"
 )
 
 type JobHandler struct {
@@ -15,6 +16,14 @@ type JobHandler struct {
 func NewJobHandler() *JobHandler {
 	return &JobHandler{
 		jobSvc: service.NewJobService(),
+	}
+}
+
+func RegisterRoutes(r *gin.Engine) {
+	h := NewJobHandler()
+	v1 := r.Group("/api/v1")
+	{
+		v1.POST("/jobs/seed", h.HandleSeed)
 	}
 }
 

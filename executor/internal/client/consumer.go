@@ -7,10 +7,11 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/IBM/sarama"
-	"go-flash-job/internal/executor/worker"
+	"go-flash-job/executor/internal/worker"
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/mq"
+
+	"github.com/IBM/sarama"
 )
 
 // ExecutionLog 定义要发送到 Kafka 的日志结构

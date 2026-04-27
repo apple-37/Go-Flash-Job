@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/gin-gonic/gin"
-	v1 "go-flash-job/api/http/v1"
-	"go-flash-job/internal/scheduler/core"
 	"go-flash-job/pkg/config" // 引入 config
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/mq"
+	"go-flash-job/scheduler/internal/api"
+	"go-flash-job/scheduler/internal/core"
+
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -31,7 +32,7 @@ func main() {
 
 	// 4. 启动 HTTP API Server (不变)
 	r := gin.Default()
-	v1.RegisterRoutes(r)
+	api.RegisterRoutes(r)
 
 	// 5. [重构] 使用配置中的端口
 	port := config.AppConfig.Server.Port

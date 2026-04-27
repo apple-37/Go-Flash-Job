@@ -6,12 +6,13 @@ import (
 	"log"
 	"time"
 
-	"github.com/IBM/sarama"
-	"go-flash-job/internal/logger/store"
+	"go-flash-job/logger/internal/store"
+	"go-flash-job/pkg/config" // 引入 config
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
-	"go-flash-job/pkg/config" // 引入 config
+
+	"github.com/IBM/sarama"
 )
 
 // KafkaLogMsg 对应我们在 Executor 发出的 JSON 结构
