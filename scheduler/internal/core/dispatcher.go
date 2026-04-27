@@ -3,33 +3,48 @@ package core
 import (
 	"container/heap"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/redis/go-redis/v9"
-	"go-flash-job/pkg/consts" 
+	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/mq"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
 )
 
-// ==========================================
-// 1. 定义本地最小堆 (Local Queue / G)
-// ==========================================
+const (
+	fetchInterval         = 5 * time.Second
+	preloadWindow         = 10 * time.Second
+	publishTimeout        = 3 * time.Second
+	maxRetryBackoff       = 30 * time.Second
+	recoverPendingBatch   = 1000
+	recoverPendingTimeout = 2 * time.Minute
+)
 
-// Task 代表一个待执行的任务 (G)
+// Task 代表一个待执行的任务。
 type Task struct {
 	JobID       string
-	TriggerTime int64 // 触发时间的时间戳 (秒)
+	TriggerTime int64 // 触发时间戳（秒）
+	RetryCount  int
 }
 
-// TaskHeap 实现 container/heap 接口
-type TaskHeap[]*Task
+// TaskCommand 是推送到 MQ 的任务消息体。
+type TaskCommand struct {
+	JobID       string `json:"job_id"`
+	TriggerTime int64  `json:"trigger_time"`
+}
+
+// TaskHeap 实现 container/heap 接口。
+type TaskHeap []*Task
 
 func (h TaskHeap) Len() int           { return len(h) }
-func (h TaskHeap) Less(i, j int) bool { return h[i].TriggerTime < h[j].TriggerTime } // 最小堆：时间早的排在前面
+func (h TaskHeap) Less(i, j int) bool { return h[i].TriggerTime < h[j].TriggerTime }
 func (h TaskHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *TaskHeap) Push(x interface{}) {
 	*h = append(*h, x.(*Task))
@@ -38,18 +53,14 @@ func (h *TaskHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
 	item := old[n-1]
-	*h = old[0 : n-1]
+	*h = old[:n-1]
 	return item
 }
-
-// ==========================================
-// 2. 调度引擎核心 (Dispatcher)
-// ==========================================
 
 type Dispatcher struct {
 	localQueue TaskHeap
 	mu         sync.Mutex
-	wakeCh     chan struct{} // 用于唤醒 M (执行器) 的信号
+	wakeCh     chan struct{}
 }
 
 func NewDispatcher() *Dispatcher {
@@ -59,121 +70,186 @@ func NewDispatcher() *Dispatcher {
 	}
 }
 
-// Start 启动调度器引擎
-func (d *Dispatcher) Start() {
+// Start 启动调度器引擎。
+func (d *Dispatcher) Start(ctx context.Context) {
 	heap.Init(&d.localQueue)
+	d.recoverPendingTasks(ctx)
 
-	// 启动 P (拉取器): 负责从 Global Queue 获取任务
-	go d.fetcherLoop()
-
-	// 启动 M (执行器): 负责精准触发任务
-	go d.executorLoop()
+	go d.fetcherLoop(ctx)
+	go d.executorLoop(ctx)
 
 	fmt.Println("🚀 GMP 调度引擎已启动...")
 }
 
-// ==========================================
-// 3. P 协程: Work Stealing (从 Redis 拉取)
-// ==========================================
-func (d *Dispatcher) fetcherLoop() {
-	ticker := time.NewTicker(5 * time.Second) // 每 5 秒拉取一次
+// recoverPendingTasks 把异常退出遗留在 pending 的任务重新归还到 global，避免永久丢失。
+func (d *Dispatcher) recoverPendingTasks(ctx context.Context) {
+	luaScript := redis.NewScript(`
+		local members = redis.call('ZRANGE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
+		for i=1,#members,2 do
+			redis.call('ZADD', KEYS[2], members[i+1], members[i])
+			redis.call('ZREM', KEYS[1], members[i])
+		end
+		return #members / 2
+	`)
+
+	res, err := luaScript.Run(ctx, database.RDB, []string{consts.JobPendingZSetKey, consts.JobZSetKey}, recoverPendingBatch-1).Int64()
+	if err != nil && err != redis.Nil {
+		log.Printf("⚠️ pending 任务回收失败: %v", err)
+		return
+	}
+	if res > 0 {
+		log.Printf("♻️ 已回收 %d 条 pending 任务到 global queue", res)
+	}
+}
+
+func (d *Dispatcher) fetcherLoop(ctx context.Context) {
+	ticker := time.NewTicker(fetchInterval)
 	defer ticker.Stop()
 
-	ctx := context.Background()
-
-	// 简历亮点：使用 Lua 脚本保证 ZRANGE 和 ZREM 的原子性，防止分布式多节点重复拉取
+	// 原子地把任务从 global 转到 pending，避免“先删后发 MQ”导致静默丢失。
 	luaScript := redis.NewScript(`
-		local keys = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
-		if #keys > 0 then
-			redis.call('ZREM', KEYS[1], unpack(keys))
+		local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
+		for i=1,#items,2 do
+			redis.call('ZADD', KEYS[2], items[i+1], items[i])
+			redis.call('ZREM', KEYS[1], items[i])
 		end
-		return keys
+		return items
 	`)
 
 	for {
-		<-ticker.C
-		// 预加载未来 10 秒内的任务
-		maxScore := time.Now().Add(10 * time.Second).Unix()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 
-		// 执行 Lua 脚本批量拉取
-		result, err := luaScript.Run(ctx, database.RDB,[]string{consts.JobZSetKey}, maxScore).StringSlice()
+		maxScore := time.Now().Add(preloadWindow).Unix()
+		result, err := luaScript.Run(ctx, database.RDB, []string{consts.JobZSetKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
 		if err != nil && err != redis.Nil {
 			log.Printf("⚠️ Redis 拉取任务失败: %v", err)
 			continue
 		}
 
 		if len(result) == 0 {
+			d.recoverStalePending(ctx)
+			continue
+		}
+		if len(result)%2 != 0 {
+			log.Printf("⚠️ Redis 返回了非法任务载荷，len=%d", len(result))
 			continue
 		}
 
-		fmt.Printf("📦 [Fetcher] 偷取到 %d 个任务，放入 Local Queue\n", len(result))
+		count := len(result) / 2
+		fmt.Printf("📦 [Fetcher] 抢到 %d 个任务，放入 Local Queue\n", count)
 
-		// 加锁，将任务推入本地最小堆
 		d.mu.Lock()
-		for _, jobID := range result {
+		for i := 0; i < len(result); i += 2 {
+			jobID := result[i]
+			triggerTime, parseErr := strconv.ParseInt(result[i+1], 10, 64)
+			if parseErr != nil {
+				log.Printf("⚠️ triggerTime 解析失败, job=%s score=%s err=%v", jobID, result[i+1], parseErr)
+				continue
+			}
 			heap.Push(&d.localQueue, &Task{
 				JobID:       jobID,
-				// 简化：真实场景需要从 DB 或缓存拿真实时间，这里假设我们直接推送到堆里尽快执行
-				TriggerTime: time.Now().Unix(), 
+				TriggerTime: triggerTime,
 			})
 		}
 		d.mu.Unlock()
-
-		// 唤醒 M 协程去检查新的堆顶任务
-		select {
-		case d.wakeCh <- struct{}{}:
-		default:
-		}
+		d.notifyWake()
 	}
 }
 
-// ==========================================
-// 4. M 协程: 无忙等待的精准触发
-// ==========================================
-func (d *Dispatcher) executorLoop() {
-	// 创建一个定时器，初始置为休眠状态
+// recoverStalePending 将长时间未确认的 pending 任务归还到 global。
+func (d *Dispatcher) recoverStalePending(ctx context.Context) {
+	deadline := time.Now().Add(-recoverPendingTimeout).Unix()
+	luaScript := redis.NewScript(`
+		local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
+		for i=1,#items,2 do
+			redis.call('ZADD', KEYS[2], items[i+1], items[i])
+			redis.call('ZREM', KEYS[1], items[i])
+		end
+		return #items / 2
+	`)
+
+	count, err := luaScript.Run(ctx, database.RDB, []string{consts.JobPendingZSetKey, consts.JobZSetKey}, deadline).Int64()
+	if err != nil && err != redis.Nil {
+		log.Printf("⚠️ stale pending 回收失败: %v", err)
+		return
+	}
+	if count > 0 {
+		log.Printf("♻️ 回收 %d 条 stale pending 任务", count)
+	}
+}
+
+func (d *Dispatcher) executorLoop(ctx context.Context) {
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		d.mu.Lock()
 		if d.localQueue.Len() == 0 {
 			d.mu.Unlock()
-			// 堆为空，永久休眠，等待 fetcher 唤醒
-			<-d.wakeCh 
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.wakeCh:
+			}
 			continue
 		}
 
-		// 获取堆顶任务（即将要执行的任务）
 		topTask := d.localQueue[0]
 		now := time.Now().Unix()
-		
+
 		var waitDuration time.Duration
 		if topTask.TriggerTime <= now {
-			waitDuration = 0 // 已经到期，立即执行
+			waitDuration = 0
 		} else {
 			waitDuration = time.Duration(topTask.TriggerTime-now) * time.Second
 		}
 		d.mu.Unlock()
 
 		if waitDuration == 0 {
-			// [核心动作] 任务到期，弹出并推送到 RabbitMQ
 			d.mu.Lock()
 			taskToRun := heap.Pop(&d.localQueue).(*Task)
 			d.mu.Unlock()
 
-			d.publishToMQ(taskToRun.JobID)
-			continue // 继续检查下一个堆顶任务
+			if err := d.publishToMQ(ctx, taskToRun.JobID, taskToRun.TriggerTime); err != nil {
+				next := time.Now().Add(backoffDuration(taskToRun.RetryCount + 1)).Unix()
+				taskToRun.RetryCount++
+				taskToRun.TriggerTime = next
+
+				d.mu.Lock()
+				heap.Push(&d.localQueue, taskToRun)
+				d.mu.Unlock()
+				d.notifyWake()
+				continue
+			}
+
+			if _, err := database.RDB.ZRem(ctx, consts.JobPendingZSetKey, taskToRun.JobID).Result(); err != nil {
+				log.Printf("⚠️ 任务 %s 已投递 MQ 但 pending 移除失败: %v", taskToRun.JobID, err)
+			}
+			continue
 		}
 
-		// 任务没到期，重置 Timer，挂起协程 (让出 CPU)
 		timer.Reset(waitDuration)
-
 		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
 		case <-timer.C:
-			// 定时器到期，自动进入下一次循环去 Pop 任务
 		case <-d.wakeCh:
-			// 在休眠期间，Fetcher 拉取了更早的新任务，唤醒重新计算时间
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -184,22 +260,50 @@ func (d *Dispatcher) executorLoop() {
 	}
 }
 
-// 将到期的任务发送给执行器 (Worker)
-func (d *Dispatcher) publishToMQ(jobID string) {
-	err := mq.RabbitChannel.PublishWithContext(
-		context.Background(),
-		"",               // exchange
-		consts.TaskQueue, // routing key
-		false,            // mandatory
-		false,            // immediate
+// publishToMQ 将到期任务发送给执行器。
+func (d *Dispatcher) publishToMQ(ctx context.Context, jobID string, triggerTime int64) error {
+	publishCtx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
+
+	body, err := json.Marshal(TaskCommand{JobID: jobID, TriggerTime: triggerTime})
+	if err != nil {
+		return fmt.Errorf("marshal task command failed: %w", err)
+	}
+
+	err = mq.RabbitChannel.PublishWithContext(
+		publishCtx,
+		"",
+		consts.TaskQueue,
+		false,
+		false,
 		amqp.Publishing{
-			ContentType: "text/plain",
-			Body:[]byte(jobID), // 将 JobID 丢进 MQ
+			ContentType: "application/json",
+			Body:        body,
 		},
 	)
 	if err != nil {
-		log.Printf("❌ 任务 %s 推送 MQ 失败: %v\n", jobID, err)
-	} else {
-		fmt.Printf("⚡ [Dispatcher] 任务 %s 已到期，成功推入 RabbitMQ\n", jobID)
+		log.Printf("❌ 任务 %s 推送 MQ 失败: %v", jobID, err)
+		return err
 	}
+
+	fmt.Printf("⚡ [Dispatcher] 任务 %s 已到期，成功推入 RabbitMQ\n", jobID)
+	return nil
+}
+
+func (d *Dispatcher) notifyWake() {
+	select {
+	case d.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
+func backoffDuration(retry int) time.Duration {
+	if retry <= 0 {
+		return 0
+	}
+	backoff := time.Second << (retry - 1)
+	if backoff > maxRetryBackoff {
+		return maxRetryBackoff
+	}
+	return backoff
 }

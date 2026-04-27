@@ -1,14 +1,18 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 
 	"go-flash-job/executor/internal/worker"
 	"go-flash-job/pkg/consts"
+	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/mq"
 
 	"github.com/IBM/sarama"
@@ -22,8 +26,23 @@ type ExecutionLog struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
-func StartConsumer() {
+// TaskCommand 对应 scheduler 推送到 RabbitMQ 的消息体。
+type TaskCommand struct {
+	JobID       string `json:"job_id"`
+	TriggerTime int64  `json:"trigger_time"`
+}
+
+const dedupeTTL = 24 * time.Hour
+
+var logPool = sync.Pool{
+	New: func() interface{} {
+		return &ExecutionLog{}
+	},
+}
+
+func StartConsumer(ctx context.Context) {
 	ch := mq.RabbitChannel
+	consumerTag := fmt.Sprintf("executor-%d", time.Now().UnixNano())
 
 	// [核心面试点] QoS (Quality of Service) 设置
 	// PrefetchCount = 50 意味着 RabbitMQ 最多只给这个消费者推送 50 条未经 Ack 的消息。
@@ -39,7 +58,7 @@ func StartConsumer() {
 
 	msgs, err := ch.Consume(
 		consts.TaskQueue, // queue
-		"",               // consumer
+		consumerTag,
 		false,            // auto-ack (⚠️ 必须设为 false，我们要手动 Ack 保证至少消费一次)
 		false,            // exclusive
 		false,            // no-local
@@ -56,50 +75,130 @@ func StartConsumer() {
 	fmt.Println("🎧 Executor 已启动，正在监听任务队列...")
 
 	// 持续监听消息通道
-	for msg := range msgs {
-		jobID := string(msg.Body)
-		currentMsg := msg // 闭包变量捕获
+	for {
+		select {
+		case <-ctx.Done():
+			if err := ch.Cancel(consumerTag, false); err != nil {
+				log.Printf("⚠️ 取消 RabbitMQ 消费失败: %v", err)
+			}
+			pool.Wait()
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				pool.Wait()
+				return
+			}
 
-		// 将任务提交给协程池
-		// 如果此时有 50 个任务正在执行，Submit 会阻塞，这里的 for 循环也会暂停取消息
-		pool.Submit(func() {
-			startTime := time.Now()
+			cmd := parseTaskCommand(msg.Body)
+			jobID := cmd.JobID
+			currentMsg := msg // 闭包变量捕获
 
-			// --- 模拟真实业务逻辑 (如发起 HTTP 请求) ---
-			// 这里我们用随机休眠 50~200ms 来模拟业务耗时
-			simulateWorkDuration := time.Duration(rand.Intn(150)+50) * time.Millisecond
-			time.Sleep(simulateWorkDuration)
-			// ----------------------------------------
+			pool.Submit(func() {
+				duplicate, err := checkAndMarkIdempotency(ctx, cmd)
+				if err != nil {
+					log.Printf("⚠️ 任务[%s]幂等检查失败，将重入队: %v", jobID, err)
+					if nackErr := currentMsg.Nack(false, true); nackErr != nil {
+						log.Printf("❌ Nack 失败: %v", nackErr)
+					}
+					return
+				}
 
-			cost := time.Since(startTime).Milliseconds()
-			fmt.Printf("✅ 任务 [%s] 执行完毕，耗时: %d ms\n", jobID, cost)
+				if duplicate {
+					log.Printf("↩️ 任务[%s]命中去重键，跳过重复执行", jobID)
+					if err := currentMsg.Ack(false); err != nil {
+						log.Printf("❌ Ack 失败: %v", err)
+					}
+					return
+				}
 
-			// 1. 业务执行成功后，手动向 RabbitMQ 发送 Ack (确认消费)
-			// 如果中途宕机没有 Ack，MQ 会自动将消息重新入队，保证【At-least-once投递】
-			currentMsg.Ack(false)
+				startTime := time.Now()
 
-			// 2. 异步将执行日志发送到 Kafka
-			sendLogToKafka(jobID, cost)
-		})
+				// --- 模拟真实业务逻辑 (如发起 HTTP 请求) ---
+				simulateWorkDuration := time.Duration(rand.Intn(150)+50) * time.Millisecond
+				time.Sleep(simulateWorkDuration)
+				// ----------------------------------------
+
+				cost := time.Since(startTime).Milliseconds()
+				fmt.Printf("✅ 任务 [%s] 执行完毕，耗时: %d ms\n", jobID, cost)
+
+				// 先写日志，再 Ack：避免 Ack 成功后日志丢失。
+				if err := sendLogToKafka(ctx, jobID, cost); err != nil {
+					log.Printf("⚠️ 任务[%s]日志发送失败，消息将重新入队: %v", jobID, err)
+					if nackErr := currentMsg.Nack(false, true); nackErr != nil {
+						log.Printf("❌ Nack 失败: %v", nackErr)
+					}
+					return
+				}
+
+				if err := currentMsg.Ack(false); err != nil {
+					log.Printf("❌ Ack 失败: %v", err)
+				}
+			})
+		}
 	}
 }
 
-// sendLogToKafka 异步发送日志
-func sendLogToKafka(jobID string, cost int64) {
-	logData := ExecutionLog{
+func parseTaskCommand(body []byte) TaskCommand {
+	var cmd TaskCommand
+	if err := json.Unmarshal(body, &cmd); err == nil && cmd.JobID != "" {
+		return cmd
+	}
+
+	// 兼容旧版本纯文本消息。
+	return TaskCommand{JobID: string(body), TriggerTime: 0}
+}
+
+func checkAndMarkIdempotency(ctx context.Context, cmd TaskCommand) (bool, error) {
+	if database.RDB == nil {
+		return false, errors.New("redis client is nil")
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+
+	created, err := database.RDB.SetNX(checkCtx, dedupeKey(cmd), 1, dedupeTTL).Result()
+	if err != nil {
+		return false, err
+	}
+	return !created, nil
+}
+
+func dedupeKey(cmd TaskCommand) string {
+	return fmt.Sprintf("%s:%s:%d", consts.ExecDedupeKeyPrefix, cmd.JobID, cmd.TriggerTime)
+}
+
+// sendLogToKafka 将日志放入 Kafka 输入通道，超时则快速失败，避免 worker 卡死。
+func sendLogToKafka(ctx context.Context, jobID string, cost int64) error {
+	if mq.KafkaProducer == nil {
+		return errors.New("kafka producer is nil")
+	}
+
+	logData := logPool.Get().(*ExecutionLog)
+	*logData = ExecutionLog{
 		JobID:     jobID,
-		Status:    0, // 假设都成功
+		Status:    0,
 		CostMs:    cost,
 		Timestamp: time.Now().Unix(),
 	}
-	
-	bytes, _ := json.Marshal(logData)
+
+	bytes, err := json.Marshal(logData)
+	logPool.Put(logData)
+	if err != nil {
+		return fmt.Errorf("json marshal failed: %w", err)
+	}
 
 	msg := &sarama.ProducerMessage{
 		Topic: consts.JobLogTopic,
 		Value: sarama.ByteEncoder(bytes),
 	}
 
-	// 异步发送，不阻塞 Executor 的当前协程
-	mq.KafkaProducer.Input() <- msg
+	sendCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+
+	select {
+	case <-sendCtx.Done():
+		return fmt.Errorf("kafka enqueue timeout: %w", sendCtx.Err())
+	case mq.KafkaProducer.Input() <- msg:
+		return nil
+	}
 }

@@ -7,7 +7,7 @@
 ## 一、架构总览
 
 - scheduler：调度服务，负责从 Redis 全局队列拉取任务并按时推送到 RabbitMQ。
-- executor：执行服务，负责消费 RabbitMQ 任务并执行，同时把执行日志写入 Kafka。
+- executor：执行服务，负责消费 RabbitMQ 任务并执行（含 Redis 去重与幂等保护），同时把执行日志写入 Kafka。
 - logger：日志服务，负责消费 Kafka 日志并批量落库 MySQL。
 
 任务链路：
@@ -16,6 +16,15 @@
 2. scheduler 预拉取任务到本地最小堆并按触发时间推送到 RabbitMQ
 3. executor 消费 RabbitMQ 执行任务，发送日志到 Kafka
 4. logger 消费 Kafka，批量写入 MySQL，并定时清理过期日志
+
+任务消息格式（scheduler -> executor）：
+
+```json
+{
+  "job_id": "seed_job_1",
+  "trigger_time": 1714200000
+}
+```
 
 ## 二、技术栈
 
@@ -93,7 +102,29 @@ scheduler 启动后，可调用压测接口写入测试任务：
 2. executor 日志显示任务被消费并执行
 3. logger 日志显示日志被批量落库
 
-## 八、设计亮点
+幂等验证：
+
+1. 重复投递同一个 job_id + trigger_time 的消息
+2. executor 日志会打印“命中去重键，跳过重复执行”
+3. 同一任务不会重复执行业务逻辑
+
+## 八、可靠性与幂等策略
+
+1. 至少一次投递
+   RabbitMQ 手动 Ack；任务消息只有在日志成功入 Kafka 后才 Ack。
+
+2. 调度防丢
+   scheduler 从 Redis global queue 原子搬运到 pending queue，成功投递 MQ 后再删除 pending。
+
+3. 幂等去重键
+   executor 使用 Redis SetNX 建立去重键：
+   flash_job:exec_dedupe:{job_id}:{trigger_time}
+   TTL 默认 24 小时。
+
+4. 重复消息处理
+   若去重键已存在，则直接 Ack 并跳过执行，控制重复副作用。
+
+## 九、设计亮点
 
 1. 调度核心无忙等待
    通过 Redis ZSet + 本地最小堆 + Timer 精准挂起，避免轮询空转。
