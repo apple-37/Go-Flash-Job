@@ -3,9 +3,6 @@
 server:
   port: ":8080"
 
-mysql:
-  dsn: "user:password@tcp(127.0.0.1:3306)/go_flash_job?charset=utf8mb4&parseTime=True&loc=Local"
-
 redis:
   addr: "127.0.0.1:6379"
   password: ""
@@ -17,3 +14,8 @@ kafka:
 
 rabbitmq:
   url: "amqp://user:password@localhost:5672/"
+
+logger:
+  dir: "./logs"
+  max_size_mb: 100
+  max_keep_days: 7

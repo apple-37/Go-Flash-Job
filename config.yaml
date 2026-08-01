@@ -4,10 +4,6 @@
 server:
   port: ":8080"
 
-# 数据库
-mysql:
-  dsn: "go_pro:2005@tcp(127.0.0.1:3306)/go_flash_job?charset=utf8mb4&parseTime=True&loc=Local"
-
 # Redis
 redis:
   addr: "127.0.0.1:6379"
@@ -22,3 +18,9 @@ kafka:
 # RabbitMQ
 rabbitmq:
   url: "amqp://admin:admin@localhost:5672/"
+
+# 日志文件配置
+logger:
+  dir: "./logs"
+  max_size_mb: 100        # 单文件最大 100MB
+  max_keep_days: 7        # 保留 7 天

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
+	"go-flash-job/pkg/model"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -26,27 +28,38 @@ func NewJobService() *JobService {
 func (s *JobService) SeedFakeJobs(ctx context.Context, count int) error {
 	log.Printf("🔥 准备瞬间注入 %d 个任务进行压测...", count)
 
-	// 1. 使用 Redis Pipeline 批量写入，极大减少网络 RTT 开销
 	pipe := database.RDB.Pipeline()
-
 	now := time.Now().Unix()
-	
-	// 生成任务：模拟未来的 1~60 秒内随机触发
-	for i := 0; i < count; i++ {
-		// 模拟生成 jobID
-		jobID := "seed_job_" + strconv.Itoa(i)
-		
-		// 假定任务在未来 5 秒后触发
-		triggerTime := now + 5 
 
-		// 将任务压入 Redis ZSet (Score = 触发时间戳)
+	priorities := []string{consts.PriorityHigh, consts.PriorityMedium, consts.PriorityLow}
+
+	for i := 0; i < count; i++ {
+		taskID := fmt.Sprintf("seed_job_%d", i)
+		// 随机触发时间：未来 1~30 秒
+		offset := 1 + randInt(30)
+		triggerTime := now + int64(offset)
+
+		// 随机优先级
+		priority := priorities[i%3]
+
+		task := model.Task{
+			ID:          taskID,
+			Name:        "seed_task",
+			FuncName:    "mock_work",
+			TriggerTime: triggerTime,
+			Priority:    priority,
+			MaxRetry:    consts.DefaultMaxRetry,
+			Timeout:     30,
+		}
+
+		// 序列化为 JSON 存入 ZSet member
+		taskJSON, _ := json.Marshal(task)
 		pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 			Score:  float64(triggerTime),
-			Member: jobID,
+			Member: string(taskJSON),
 		})
 	}
 
-	// 执行 Pipeline
 	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("Redis Pipeline 写入失败: %v", err)
@@ -60,34 +73,28 @@ func (s *JobService) SeedFakeJobs(ctx context.Context, count int) error {
 func (s *JobService) LoadJobsFromFiles(ctx context.Context) error {
 	log.Printf("📁 准备从/data目录读取job文件...")
 
-	// 检查/data目录是否存在
 	dataDir := "./data"
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
 		return fmt.Errorf("data目录不存在: %v", err)
 	}
 
-	// 读取/data目录下的所有文件
 	files, err := os.ReadDir(dataDir)
 	if err != nil {
 		return fmt.Errorf("读取data目录失败: %v", err)
 	}
 
-	// 使用 Redis Pipeline 批量写入
 	pipe := database.RDB.Pipeline()
 	now := time.Now().Unix()
+	count := 0
 
-	// 解析每个job文件
 	for _, file := range files {
 		if file.IsDir() {
 			continue
 		}
-
-		// 只处理.job文件
 		if filepath.Ext(file.Name()) != ".job" {
 			continue
 		}
 
-		// 读取文件内容
 		filePath := filepath.Join(dataDir, file.Name())
 		content, err := os.ReadFile(filePath)
 		if err != nil {
@@ -95,71 +102,153 @@ func (s *JobService) LoadJobsFromFiles(ctx context.Context) error {
 			continue
 		}
 
-		// 解析文件内容
-		jobID, priority, err := s.parseJobFile(string(content))
+		task, err := s.parseJobFile(string(content), now)
 		if err != nil {
 			log.Printf("⚠️ 解析文件 %s 失败: %v", file.Name(), err)
 			continue
 		}
 
-		// 生成任务ID
-		taskID := fmt.Sprintf("job_%s", jobID)
-
-		// 假定任务在未来 5 秒后触发
-		triggerTime := now + 5
-
-		// 将任务压入 Redis ZSet (Score = 触发时间戳)
-		// 注意：这里我们将优先级信息存储在任务ID中，格式为 "job_[ID]_[Priority]"
-		taskIDWithPriority := fmt.Sprintf("%s_%s", taskID, priority)
+		taskJSON, _ := json.Marshal(task)
 		pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
-			Score:  float64(triggerTime),
-			Member: taskIDWithPriority,
+			Score:  float64(task.TriggerTime),
+			Member: string(taskJSON),
 		})
 
-		log.Printf("✅ 从文件 %s 读取任务: ID=%s, Priority=%s", file.Name(), jobID, priority)
+		log.Printf("✅ 从文件 %s 读取任务: ID=%s, Name=%s, Priority=%s, TriggerTime=%d",
+			file.Name(), task.ID, task.Name, task.Priority, task.TriggerTime)
+		count++
 	}
 
-	// 执行 Pipeline
+	if count == 0 {
+		log.Println("⚠️ 没有找到有效的 .job 文件")
+		return nil
+	}
+
 	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("Redis Pipeline 写入失败: %v", err)
 	}
 
-	fmt.Printf("✅ 成功从/data目录加载任务到 Redis 全局队列\n")
+	fmt.Printf("✅ 成功从/data目录加载 %d 个任务到 Redis 全局队列\n", count)
 	return nil
 }
 
-// parseJobFile 解析job文件内容，提取JobID和Priority
-func (s *JobService) parseJobFile(content string) (jobID, priority string, err error) {
+// parseJobFile 解析job文件内容
+// 文件格式：
+// [JobID]
+// 0
+// [Name]
+// send_email
+// [FuncName]
+// send_email
+// [TriggerTime]
+// 5
+// [Priority]
+// High
+// [MaxRetry]
+// 3
+// [Timeout]
+// 30
+// [Payload]
+// {"to":"user@example.com"}
+func (s *JobService) parseJobFile(content string, now int64) (*model.Task, error) {
 	lines := strings.Split(content, "\n")
-	inJobID := false
-	inPriority := false
+	fields := make(map[string]string)
 
+	currentSection := ""
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "[JobID]" {
-			inJobID = true
-			continue
-		} else if line == "[Priority]" {
-			inJobID = false
-			inPriority = true
-			continue
-		} else if line == "[Created]" || line == "[Tasks]" {
-			inJobID = false
-			inPriority = false
+		if line == "" {
 			continue
 		}
 
-		if inJobID && line != "" {
-			jobID = line
-		} else if inPriority && line != "" {
-			priority = line
+		// 检查是否是 section 标记
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+			continue
+		}
+
+		if currentSection != "" {
+			// 多行字段（如 Payload）使用追加
+			if existing, ok := fields[currentSection]; ok {
+				fields[currentSection] = existing + "\n" + line
+			} else {
+				fields[currentSection] = line
+			}
 		}
 	}
 
-	if jobID == "" || priority == "" {
-		return "", "", fmt.Errorf("文件格式不正确，缺少JobID或Priority字段")
+	// 必填字段校验
+	if fields["JobID"] == "" {
+		return nil, fmt.Errorf("缺少 JobID 字段")
 	}
 
-	return jobID, priority, nil
+	task := &model.Task{
+		ID:       fields["JobID"],
+		Name:     fields["Name"],
+		FuncName: fields["FuncName"],
+		Priority: fields["Priority"],
+	}
+
+	// 设置默认值
+	if task.Name == "" {
+		task.Name = "task_" + task.ID
+	}
+	if task.FuncName == "" {
+		task.FuncName = "mock_work"
+	}
+	if task.Priority == "" {
+		task.Priority = consts.PriorityLow
+	}
+
+	// 解析触发时间
+	if fields["TriggerTime"] != "" {
+		// 如果是相对时间（小于当前时间戳的整数），则当作偏移量
+		triggerOffset, err := strconv.ParseInt(fields["TriggerTime"], 10, 64)
+		if err == nil {
+			if triggerOffset < 1000000000 {
+				// 当作偏移量
+				task.TriggerTime = now + triggerOffset
+			} else {
+				// 当作绝对时间戳
+				task.TriggerTime = triggerOffset
+			}
+		}
+	} else {
+		// 默认 5 秒后触发
+		task.TriggerTime = now + 5
+	}
+
+	// 解析最大重试次数
+	if fields["MaxRetry"] != "" {
+		if maxRetry, err := strconv.Atoi(fields["MaxRetry"]); err == nil {
+			task.MaxRetry = maxRetry
+		}
+	} else {
+		task.MaxRetry = consts.DefaultMaxRetry
+	}
+
+	// 解析超时
+	if fields["Timeout"] != "" {
+		if timeout, err := strconv.Atoi(fields["Timeout"]); err == nil {
+			task.Timeout = timeout
+		}
+	} else {
+		task.Timeout = 30
+	}
+
+	// 解析 Payload
+	if fields["Payload"] != "" {
+		task.Payload = []byte(fields["Payload"])
+	}
+
+	return task, nil
+}
+
+// randInt 返回 [0, n) 的随机整数
+func randInt(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return int(time.Now().UnixNano()) % n
 }

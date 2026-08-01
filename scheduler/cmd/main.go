@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"go-flash-job/pkg/config" 
+	"go-flash-job/pkg/config"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/mq"
 	"go-flash-job/scheduler/internal/api"
@@ -28,18 +28,17 @@ func main() {
 	config.InitConfig()
 
 	// 2. 使用配置初始化基础设施
-	database.InitMySQL(config.AppConfig.MySQL.DSN)
 	database.InitRedis(config.AppConfig.Redis)
 	mq.InitKafka(config.AppConfig.Kafka.Brokers)
 	mq.InitRabbitMQ(config.AppConfig.RabbitMQ.URL)
-	defer database.CloseMySQL()
 	defer database.CloseRedis()
 	defer mq.CloseKafka()
 	defer mq.CloseRabbitMQ()
 
-	// 3. 启动核心调度引擎 
-	dispatcher := core.NewDispatcher()
-	dispatcher.Start(ctx)
+	// 3. 启动 GMP 调度引擎
+	scheduler := core.NewScheduler()
+	scheduler.Start(ctx)
+	defer scheduler.Stop()
 
 	// 4. 从/data目录加载任务文件
 	jobService := service.NewJobService()
@@ -49,11 +48,10 @@ func main() {
 		log.Println("✅ 成功从/data目录加载任务文件")
 	}
 
-	// 5. 启动 HTTP API Server 
+	// 5. 启动 HTTP API Server
 	r := gin.Default()
 	api.RegisterRoutes(r)
 
-	// 5. 使用配置中的端口
 	port := config.AppConfig.Server.Port
 	fmt.Printf("🌟 Scheduler HTTP 服务启动于 %s\n", port)
 

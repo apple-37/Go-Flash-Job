@@ -15,6 +15,20 @@ import (
 var RDB *redis.Client
 var ctx = context.Background()
 
+const (
+	maxInitAttempts = 8
+	baseRetryDelay  = time.Second
+)
+
+// retryDelay 指数退避重试
+func retryDelay(attempt int) time.Duration {
+	d := baseRetryDelay * time.Duration(1<<(attempt-1))
+	if d > 10*time.Second {
+		return 10 * time.Second
+	}
+	return d
+}
+
 // InitRedis 接收 RedisConfig 结构体作为参数
 func InitRedis(cfg config.RedisConfig) {
 	var err error

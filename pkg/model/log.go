@@ -2,14 +2,15 @@ package model
 
 import "time"
 
+// SysJobLog 任务执行日志（用于 Kafka 传输和文件落盘）
 type SysJobLog struct {
-	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	JobID     string    `gorm:"size:64;not null;index" json:"job_id"` // 注意：为了配合我们模拟的 string id，这里改为 string
-	Status    int       `gorm:"type:tinyint;not null" json:"status"`
-	CostMs    int64     `gorm:"not null" json:"cost_ms"`
-	CreatedAt time.Time `gorm:"index" json:"created_at"` // 加索引方便按时间清理
-}
-
-func (SysJobLog) TableName() string {
-	return "sys_job_log"
+	ID        int64     `json:"id"`
+	JobID     string    `json:"job_id"`
+	Name      string    `json:"name"`
+	FuncName  string    `json:"func_name"`
+	Status    int       `json:"status"` // 0:成功, 1:失败, 2:死信
+	CostMs    int64     `json:"cost_ms"`
+	Retry     int       `json:"retry"`
+	ErrorMsg  string    `json:"error_msg"`
+	CreatedAt time.Time `json:"created_at"`
 }
