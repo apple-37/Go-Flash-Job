@@ -2,9 +2,9 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
-	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 	"go-flash-job/scheduler/internal/service"
 
@@ -66,8 +66,6 @@ func (h *JobHandler) HandleSubmit(c *gin.Context) {
 		return
 	}
 
-	metrics.JobsSubmitted.WithLabelValues(task.Priority).Inc()
-
 	c.JSON(http.StatusOK, gin.H{
 		"code": 200,
 		"msg":  "任务提交成功",
@@ -114,13 +112,6 @@ func (h *JobHandler) HandleBatchSubmit(c *gin.Context) {
 		return
 	}
 
-	// 批量埋点：按优先级聚合
-	for _, t := range req.Tasks {
-		if t.ID != "" && t.CallbackURL != "" {
-			metrics.JobsSubmitted.WithLabelValues(t.Priority).Inc()
-		}
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"code":  200,
 		"msg":   "批量任务提交成功",
@@ -131,8 +122,17 @@ func (h *JobHandler) HandleBatchSubmit(c *gin.Context) {
 // HandleListDead 查看死信队列
 // GET /api/v1/jobs/dead?start=0&stop=9
 func (h *JobHandler) HandleListDead(c *gin.Context) {
+	start, _ := strconv.ParseInt(c.DefaultQuery("start", "0"), 10, 64)
+	stop, _ := strconv.ParseInt(c.DefaultQuery("stop", "9"), 10, 64)
+	tasks, err := h.jobSvc.ListDeadJobs(c.Request.Context(), start, stop)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"code": 200,
-		"msg":  "请通过 Redis ZRANGE flash_job:dead_queue 0 -1 WITHSCORES 查看死信",
+		"code":  200,
+		"msg":   "ok",
+		"count": len(tasks),
+		"data":  tasks,
 	})
 }

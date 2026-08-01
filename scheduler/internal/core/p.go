@@ -4,11 +4,9 @@ import (
 	"container/heap"
 	"context"
 	"log"
-	"strconv"
 	"sync"
 	"time"
 
-	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 )
 
@@ -205,11 +203,6 @@ func (p *P) Run(ctx context.Context) {
 
 // executeTask 执行任务：推送 MQ + 状态机切换
 func (p *P) executeTask(ctx context.Context, task *model.Task) {
-	// 埋点：调度延迟 = 当前时间 - 任务触发时间
-	now := time.Now().Unix()
-	metrics.ScheduleLatency.WithLabelValues().Observe(float64(now - task.TriggerTime))
-	metrics.PLocalQueueSize.WithLabelValues(strconv.Itoa(p.ID)).Set(float64(p.LocalLen()))
-
 	// 1. 状态机：READY -> DISPATCHED
 	if err := p.scheduler.fsm.Fire(ctx, EventDispatch, task); err != nil {
 		log.Printf("⚠️ [P%d] FSM DISPATCH 失败 task=%s err=%v", p.ID, task.ID, err)
@@ -229,9 +222,6 @@ func (p *P) executeTask(ctx context.Context, task *model.Task) {
 	if err := p.scheduler.removeFromPending(ctx, task.ID); err != nil {
 		log.Printf("⚠️ [P%d] Pending 移除失败 task=%s err=%v", p.ID, task.ID, err)
 	}
-
-	// 埋点：更新本地队列大小
-	metrics.PLocalQueueSize.WithLabelValues(strconv.Itoa(p.ID)).Set(float64(p.LocalLen()))
 }
 
 // Stop 停止 P

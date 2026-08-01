@@ -16,7 +16,6 @@ import (
 	"go-flash-job/scheduler/internal/core"
 
 	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -43,8 +42,6 @@ func main() {
 	// 4. 启动 HTTP API Server（业务方通过 API 提交任务）
 	r := gin.Default()
 	api.RegisterRoutes(r)
-	// Prometheus metrics endpoint（供 Prometheus / Grafana 抓取）
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	port := config.AppConfig.Server.Port
 	fmt.Printf("🌟 Scheduler HTTP 服务启动于 %s\n", port)

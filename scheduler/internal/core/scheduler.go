@@ -12,7 +12,6 @@ import (
 
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
-	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 	"go-flash-job/pkg/mq"
 	"go-flash-job/pkg/shard"
@@ -203,11 +202,6 @@ func (s *Scheduler) fetcherLoop(ctx context.Context) {
 			allTasks = append(allTasks, tasks...)
 		}
 
-		// 埋点：更新队列大小（每 5 个 tick 采样一次，减少 Redis 压力）
-		if rand.Intn(5) == 0 {
-			s.updateQueueMetrics(ctx, shardKeys)
-		}
-
 		if len(allTasks) == 0 {
 			continue
 		}
@@ -250,28 +244,6 @@ func (s *Scheduler) applyAging(tasks []*model.Task) {
 		log.Printf("⚠️ 老化提升持久化失败: %v", err)
 	}
 	log.Printf("⏫ 老化提升 %d 个 Low 任务为 High", len(promoted))
-}
-
-// updateQueueMetrics 更新队列大小指标
-func (s *Scheduler) updateQueueMetrics(ctx context.Context, shardKeys []string) {
-	pipe := database.RDB.Pipeline()
-	cmds := make([]*redis.IntCmd, len(shardKeys))
-	for i, k := range shardKeys {
-		cmds[i] = pipe.ZCard(ctx, k)
-	}
-	_, _ = pipe.Exec(ctx)
-
-	var total int64
-	for _, cmd := range cmds {
-		if n, err := cmd.Result(); err == nil {
-			total += n
-		}
-	}
-	metrics.QueueSize.WithLabelValues("global").Set(float64(total))
-
-	if n, err := database.RDB.ZCard(ctx, consts.JobPendingZSetKey).Result(); err == nil {
-		metrics.QueueSize.WithLabelValues("pending").Set(float64(n))
-	}
 }
 
 // parseTasks 解析 Redis 返回的 [jobID, score, ...] 列表
@@ -351,7 +323,6 @@ func (s *Scheduler) workSteal(thief *P) []*model.Task {
 			continue
 		}
 		if stolen := p.StealHalf(); len(stolen) > 0 {
-			metrics.WorkStealCount.WithLabelValues(strconv.Itoa(thief.ID)).Inc()
 			return stolen
 		}
 	}
@@ -380,9 +351,7 @@ func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
 		return fmt.Errorf("marshal task command failed: %w", err)
 	}
 
-	// 埋点：MQ publish 耗时
 	// M1: 从 Channel 池获取独立 Channel，避免多协程并发 Publish 触发 channel exception
-	start := time.Now()
 	ch := mq.GetPublishChannel()
 	err = ch.PublishWithContext(
 		publishCtx,
@@ -395,7 +364,6 @@ func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
 			Body:        body,
 		},
 	)
-	metrics.MQPublishDuration.WithLabelValues().Observe(time.Since(start).Seconds())
 
 	if err != nil {
 		return err

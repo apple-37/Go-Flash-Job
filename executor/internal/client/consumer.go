@@ -15,7 +15,6 @@ import (
 	"go-flash-job/executor/internal/worker"
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
-	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 	"go-flash-job/pkg/mq"
 	"go-flash-job/pkg/shard"
@@ -141,9 +140,6 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 	if execErr == nil {
 		// 成功
 		fmt.Printf("✅ 任务 [%s] 执行完毕，耗时: %d ms\n", jobID, cost)
-		metrics.JobsExecuted.WithLabelValues("success").Inc()
-		metrics.TaskDuration.WithLabelValues("success").Observe(time.Since(startTime).Seconds())
-		metrics.RetryCount.WithLabelValues().Observe(float64(cmd.RetryCount))
 		if err := updateTaskState(ctx, jobID, model.StatusSuccess); err != nil {
 			log.Printf("⚠️ 任务[%s] 状态更新为 SUCCESS 失败: %v", jobID, err)
 		}
@@ -159,8 +155,6 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 	if cmd.RetryCount > cmd.MaxRetry {
 		// 超过最大重试次数，进入死信
 		log.Printf("💀 任务[%s] 已达最大重试次数 %d，进入死信: %v", jobID, cmd.MaxRetry, execErr)
-		metrics.JobsExecuted.WithLabelValues("dead").Inc()
-		metrics.TaskDuration.WithLabelValues("dead").Observe(time.Since(startTime).Seconds())
 		handleTaskDead(ctx, cmd, currentMsg, execErr.Error())
 		return
 	}
@@ -198,8 +192,6 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 	}
 
 	log.Printf("⏰ 任务[%s] 第 %d 次失败，%v 后重试: %v", jobID, cmd.RetryCount, backoff, execErr)
-	metrics.JobsExecuted.WithLabelValues("failed").Inc()
-	metrics.TaskDuration.WithLabelValues("failed").Observe(time.Since(startTime).Seconds())
 	if err := updateTaskState(ctx, jobID, model.StatusRetry); err != nil {
 		log.Printf("⚠️ 任务[%s] 状态更新为 RETRY 失败: %v", jobID, err)
 	}
@@ -233,22 +225,9 @@ func executeHTTPCallback(ctx context.Context, cmd model.TaskCommand) error {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		metrics.HTTPCallbackStatus.WithLabelValues("error").Inc()
 		return fmt.Errorf("http call failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	// 埋点：HTTP 状态码分类
-	statusClass := "2xx"
-	switch {
-	case resp.StatusCode >= 500:
-		statusClass = "5xx"
-	case resp.StatusCode >= 400:
-		statusClass = "4xx"
-	case resp.StatusCode >= 300:
-		statusClass = "3xx"
-	}
-	metrics.HTTPCallbackStatus.WithLabelValues(statusClass).Inc()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil

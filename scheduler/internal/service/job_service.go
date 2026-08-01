@@ -138,3 +138,41 @@ func (s *JobService) BatchSubmitJobs(ctx context.Context, tasks []model.Task) (i
 	log.Printf("✅ 批量提交 %d 个任务", count)
 	return count, nil
 }
+
+// ListDeadJobs 查看死信队列（按时间倒序，最新的在前）
+// start/stop 是 ZSet 的索引范围，0 -1 表示全部
+func (s *JobService) ListDeadJobs(ctx context.Context, start, stop int64) ([]map[string]interface{}, error) {
+	// ZREVRANGE 按时间倒序返回 jobID 列表
+	jobIDs, err := database.RDB.ZRevRange(ctx, consts.JobDeadZSetKey, start, stop).Result()
+	if err != nil {
+		return nil, fmt.Errorf("query dead queue failed: %w", err)
+	}
+	if len(jobIDs) == 0 {
+		return nil, nil
+	}
+
+	// 批量拉取死信详情
+	pipe := database.RDB.Pipeline()
+	cmds := make([]*redis.MapStringStringCmd, len(jobIDs))
+	for i, jobID := range jobIDs {
+		detailKey := fmt.Sprintf("flash_job:dead_detail:%s", jobID)
+		cmds[i] = pipe.HGetAll(ctx, detailKey)
+	}
+	_, _ = pipe.Exec(ctx)
+
+	result := make([]map[string]interface{}, 0, len(jobIDs))
+	for i, cmd := range cmds {
+		fields, err := cmd.Result()
+		if err != nil || len(fields) == 0 {
+			result = append(result, map[string]interface{}{"id": jobIDs[i], "msg": "detail missing"})
+			continue
+		}
+		item := make(map[string]interface{}, len(fields)+1)
+		for k, v := range fields {
+			item[k] = v
+		}
+		item["id"] = jobIDs[i]
+		result = append(result, item)
+	}
+	return result, nil
+}

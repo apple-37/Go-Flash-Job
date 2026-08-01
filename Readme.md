@@ -28,11 +28,11 @@
 
 ### 三大服务
 
-| 服务 | 职责 | 端口 |
-|---|---|---|
+| 服务          | 职责                                                        | 端口 |
+| ------------- | ----------------------------------------------------------- | ---- |
 | **scheduler** | 从 Redis 分片 ZSet 拉取到期任务，经 GMP 调度推送到 RabbitMQ | 8080 |
-| **executor** | 消费 RabbitMQ，HTTP 回调业务方服务，失败重试退避 | - |
-| **logger** | 消费 Kafka 日志，批量刷盘（100条/批，文件轮转） | - |
+| **executor**  | 消费 RabbitMQ，HTTP 回调业务方服务，失败重试退避            | -    |
+| **logger**    | 消费 Kafka 日志，批量刷盘（100条/批，文件轮转）             | -    |
 
 ### 任务链路
 
@@ -48,7 +48,6 @@
 - **语言**: Go 1.21+
 - **存储**: Redis（ZSet 分片 + Hash + Lua 脚本）
 - **消息队列**: RabbitMQ（任务分发）+ Kafka（日志管道）
-- **监控**: Prometheus + Grafana
 - **压测**: JMeter + Mock Python 服务
 
 ## 目录结构
@@ -73,7 +72,6 @@ Go-Flash-Job/
 │   ├── config/             # 配置加载 + 校验
 │   ├── consts/             # 常量定义
 │   ├── database/           # Redis 客户端
-│   ├── metrics/            # Prometheus 指标
 │   ├── model/              # 数据模型 + Redis 辅助函数
 │   ├── mq/                 # RabbitMQ + Kafka 客户端
 │   └── shard/              # ZSet 分片路由
@@ -153,9 +151,6 @@ python benchmark/submit_tasks.py --count 1000
 ### 5. 监控
 
 ```bash
-# Prometheus 指标
-curl http://localhost:8080/metrics | grep flash_
-
 # Mock 服务统计
 curl http://localhost:8000/stats
 ```
@@ -171,6 +166,7 @@ curl http://localhost:8000/stats
 ### 调度策略
 
 三层排序，保证定时精度 + 公平性：
+
 1. **触发时间优先**（定时任务核心语义）
 2. **同时间按优先级**（High > Medium > Low）
 3. **同优先级按入队时间**（FIFO 兜底）
@@ -180,6 +176,7 @@ curl http://localhost:8000/stats
 ### 重试退避
 
 失败任务写回 Redis ZSet（不 nack requeue），指数退避 + 随机抖动：
+
 ```
 1s → 2s → 4s → 8s → 16s → 30s（封顶）+ 0~500ms jitter
 ```
@@ -191,6 +188,7 @@ curl http://localhost:8000/stats
 ### FSM 状态机
 
 Lua CAS 原子状态转换，7 个状态 + 6 个事件：
+
 ```
 PENDING → READY → DISPATCHED → RUNNING → SUCCESS
                   ↓                ↓
@@ -209,11 +207,10 @@ PENDING → READY → DISPATCHED → RUNNING → SUCCESS
 
 ## API 接口
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/api/v1/jobs/submit` | 提交单个任务 |
-| POST | `/api/v1/jobs/batch` | 批量提交（≤500） |
-| GET | `/metrics` | Prometheus 指标 |
+| 方法 | 路径                  | 说明             |
+| ---- | --------------------- | ---------------- |
+| POST | `/api/v1/jobs/submit` | 提交单个任务     |
+| POST | `/api/v1/jobs/batch`  | 批量提交（≤500） |
 
 ### 限流
 
