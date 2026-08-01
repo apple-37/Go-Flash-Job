@@ -13,6 +13,7 @@ import (
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
+	"go-flash-job/pkg/shard"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -140,7 +141,7 @@ func (f *FSM) saveState(ctx context.Context, task *model.Task, status model.Task
 	_, err := database.RDB.HSet(ctx, key,
 		"id", task.ID,
 		"name", task.Name,
-		"func_name", task.FuncName,
+		"callback_url", task.CallbackURL,
 		"status", string(status),
 		"retry_count", task.RetryCount,
 		"max_retry", task.MaxRetry,
@@ -157,7 +158,7 @@ func SaveDeadTask(ctx context.Context, task *model.Task, errMsg string) error {
 	if err := database.RDB.HSet(ctx, detailKey,
 		"id", task.ID,
 		"name", task.Name,
-		"func_name", task.FuncName,
+		"callback_url", task.CallbackURL,
 		"retry_count", task.RetryCount,
 		"error", errMsg,
 		"dead_at", time.Now().Unix(),
@@ -224,7 +225,7 @@ func (f *FSM) RecoverStaleTasks(ctx context.Context) (int, error) {
 		task := &model.Task{
 			ID:          taskID,
 			Name:        fields["name"],
-			FuncName:    fields["func_name"],
+			CallbackURL: fields["callback_url"],
 			TriggerTime: triggerTime,
 			Priority:    consts.PriorityLow, // 恢复任务统一为低优先级
 			RetryCount:  0,
@@ -241,7 +242,7 @@ func (f *FSM) RecoverStaleTasks(ctx context.Context) (int, error) {
 		}
 
 		taskJSON, _ := json.Marshal(task)
-		_, err = database.RDB.ZAdd(ctx, consts.JobZSetKey, redis.Z{
+		_, err = database.RDB.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
 			Score:  float64(task.TriggerTime),
 			Member: string(taskJSON),
 		}).Result()
@@ -329,7 +330,7 @@ func (f *FSM) MonitorStaleStates(ctx context.Context, staleTimeout time.Duration
 		task := &model.Task{
 			ID:          taskID,
 			Name:        fields["name"],
-			FuncName:    fields["func_name"],
+			CallbackURL: fields["callback_url"],
 			TriggerTime: triggerTime,
 			Priority:    consts.PriorityLow,
 			MaxRetry:    consts.DefaultMaxRetry,
@@ -341,7 +342,7 @@ func (f *FSM) MonitorStaleStates(ctx context.Context, staleTimeout time.Duration
 		}
 
 		taskJSON, _ := json.Marshal(task)
-		_, err = database.RDB.ZAdd(ctx, consts.JobZSetKey, redis.Z{
+		_, err = database.RDB.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
 			Score:  float64(task.TriggerTime),
 			Member: string(taskJSON),
 		}).Result()

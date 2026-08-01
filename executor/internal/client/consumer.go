@@ -1,20 +1,24 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"net/http"
 	"sync"
 	"time"
 
 	"go-flash-job/executor/internal/worker"
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
+	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 	"go-flash-job/pkg/mq"
+	"go-flash-job/pkg/shard"
 
 	"github.com/IBM/sarama"
 	"github.com/redis/go-redis/v9"
@@ -24,7 +28,7 @@ import (
 type ExecutionLog struct {
 	JobID     string `json:"job_id"`
 	Name      string `json:"name"`
-	FuncName  string `json:"func_name"`
+	CallbackURL string `json:"callback_url"`
 	Status    int    `json:"status"` // 0:成功, 1:失败, 2:死信
 	CostMs    int64  `json:"cost_ms"`
 	Retry     int    `json:"retry"`
@@ -40,10 +44,17 @@ var logPool = sync.Pool{
 	},
 }
 
-func StartConsumer(ctx context.Context) {
-	// 1. 注册默认任务执行函数
-	worker.RegisterDefaults()
+// httpClient 复用连接池，避免每次任务都建立新连接
+var httpClient = &http.Client{
+	Timeout: 60 * time.Second, // 全局兜底超时，单任务超时由 context 控制
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
+func StartConsumer(ctx context.Context) {
 	ch := mq.RabbitChannel
 	consumerTag := fmt.Sprintf("executor-%d", time.Now().UnixNano())
 
@@ -60,7 +71,7 @@ func StartConsumer(ctx context.Context) {
 	msgs, err := ch.Consume(
 		consts.TaskQueue, // queue
 		consumerTag,
-		false,            // auto-ack (⚠️ 手动 ack 保证至少消费一次)
+		false,            // auto-ack (手动 ack 保证至少消费一次)
 		false,            // exclusive
 		false,            // no-local
 		false,            // no-wait
@@ -99,7 +110,7 @@ func StartConsumer(ctx context.Context) {
 	}
 }
 
-// handleTask 处理单个任务（含幂等性、FSM 状态切换、重试、死信）
+// handleTask 处理单个任务（含幂等性、FSM 状态切换、HTTP 回调、重试、死信）
 func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDelivery) {
 	jobID := cmd.ID
 
@@ -121,27 +132,18 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 		log.Printf("⚠️ 任务[%s] FSM 状态更新失败: %v", jobID, err)
 	}
 
-	// 3. 获取执行函数
-	fn, err := worker.Get(cmd.FuncName)
-	if err != nil {
-		// 函数不存在，直接进入死信
-		log.Printf("💀 任务[%s]函数未注册: %s", jobID, cmd.FuncName)
-		handleTaskDead(ctx, cmd, currentMsg, fmt.Sprintf("function not found: %s", cmd.FuncName))
-		return
-	}
-
-	// 4. 执行任务（带超时控制）
+	// 3. HTTP 回调业务方服务
 	startTime := time.Now()
-	execCtx, cancel := context.WithTimeout(ctx, time.Duration(cmd.Timeout)*time.Second)
-	defer cancel()
-
-	execErr := executeWithTimeout(execCtx, fn, cmd.Payload)
+	execErr := executeHTTPCallback(ctx, cmd)
 	cost := time.Since(startTime).Milliseconds()
 
-	// 5. 处理执行结果
+	// 4. 处理执行结果
 	if execErr == nil {
 		// 成功
 		fmt.Printf("✅ 任务 [%s] 执行完毕，耗时: %d ms\n", jobID, cost)
+		metrics.JobsExecuted.WithLabelValues("success").Inc()
+		metrics.TaskDuration.WithLabelValues("success").Observe(time.Since(startTime).Seconds())
+		metrics.RetryCount.WithLabelValues().Observe(float64(cmd.RetryCount))
 		_ = updateTaskState(ctx, jobID, model.StatusSuccess)
 		sendLogToKafka(ctx, cmd, 0, cost, "")
 		ackMsg(currentMsg)
@@ -153,41 +155,104 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 	if cmd.RetryCount > cmd.MaxRetry {
 		// 超过最大重试次数，进入死信
 		log.Printf("💀 任务[%s] 已达最大重试次数 %d，进入死信: %v", jobID, cmd.MaxRetry, execErr)
+		metrics.JobsExecuted.WithLabelValues("dead").Inc()
+		metrics.TaskDuration.WithLabelValues("dead").Observe(time.Since(startTime).Seconds())
 		handleTaskDead(ctx, cmd, currentMsg, execErr.Error())
 		return
 	}
 
-	// 重试：Nack 重新入队，由 MQ 重投
-	log.Printf("⚠️ 任务[%s] 第 %d 次失败，将重试: %v", jobID, cmd.RetryCount, execErr)
+	// 重试：写回 Redis ZSet，带指数退避延迟，由 scheduler 重新调度
+	// 不再使用 nack(requeue=true)，避免立即重投导致雪崩
+	backoff := backoffDuration(cmd.RetryCount)
+	retryAt := time.Now().Add(backoff).Unix()
+
+	task := &model.Task{
+		ID:          cmd.ID,
+		Name:        cmd.Name,
+		CallbackURL: cmd.CallbackURL,
+		TriggerTime: retryAt,
+		Priority:    cmd.Priority,
+		RetryCount:  cmd.RetryCount,
+		MaxRetry:    cmd.MaxRetry,
+		Timeout:     cmd.Timeout,
+		Payload:     cmd.Payload,
+	}
+	taskJSON, _ := json.Marshal(task)
+
+	if err := database.RDB.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
+		Score:  float64(retryAt),
+		Member: string(taskJSON),
+	}).Err(); err != nil {
+		// 写回 Redis 失败，降级为 nack requeue（保证至少不丢任务）
+		log.Printf("⚠️ 任务[%s] 重试入队失败，降级为 nack requeue: %v", jobID, err)
+		nackWithRequeue(currentMsg)
+		return
+	}
+
+	log.Printf("⏰ 任务[%s] 第 %d 次失败，%v 后重试: %v", jobID, cmd.RetryCount, backoff, execErr)
+	metrics.JobsExecuted.WithLabelValues("failed").Inc()
+	metrics.TaskDuration.WithLabelValues("failed").Observe(time.Since(startTime).Seconds())
 	_ = updateTaskState(ctx, jobID, model.StatusRetry)
 	sendLogToKafka(ctx, cmd, 1, cost, execErr.Error())
-	nackWithRequeue(currentMsg)
+	ackMsg(currentMsg) // 任务已写回 Redis，ack 掉 MQ 消息避免无限堆积
 }
 
-// executeWithTimeout 带超时的任务执行
-func executeWithTimeout(ctx context.Context, fn worker.TaskFunc, payload []byte) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- fn(payload)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("task timeout: %w", ctx.Err())
-	case err := <-done:
-		return err
+// executeHTTPCallback 通过 HTTP POST 调用业务方服务
+// - 将 Payload 作为 request body
+// - 超时由 cmd.Timeout 控制
+// - 2xx 视为成功，其他视为失败
+func executeHTTPCallback(ctx context.Context, cmd model.TaskCommand) error {
+	if cmd.CallbackURL == "" {
+		return errors.New("callback_url is empty")
 	}
+
+	// 单任务超时控制
+	execCtx, cancel := context.WithTimeout(ctx, time.Duration(cmd.Timeout)*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(execCtx, http.MethodPost, cmd.CallbackURL, bytes.NewReader(cmd.Payload))
+	if err != nil {
+		return fmt.Errorf("build request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Job-ID", cmd.ID)
+	req.Header.Set("X-Job-Name", cmd.Name)
+	req.Header.Set("X-Retry-Count", fmt.Sprintf("%d", cmd.RetryCount))
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		metrics.HTTPCallbackStatus.WithLabelValues("error").Inc()
+		return fmt.Errorf("http call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 埋点：HTTP 状态码分类
+	statusClass := "2xx"
+	switch {
+	case resp.StatusCode >= 500:
+		statusClass = "5xx"
+	case resp.StatusCode >= 400:
+		statusClass = "4xx"
+	case resp.StatusCode >= 300:
+		statusClass = "3xx"
+	}
+	metrics.HTTPCallbackStatus.WithLabelValues(statusClass).Inc()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return fmt.Errorf("callback returned status %d", resp.StatusCode)
 }
 
 // handleTaskDead 处理死信任务
 func handleTaskDead(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDelivery, errMsg string) {
 	// 1. 保存到死信队列
 	task := &model.Task{
-		ID:         cmd.ID,
-		Name:       cmd.Name,
-		FuncName:   cmd.FuncName,
-		RetryCount: cmd.RetryCount,
-		MaxRetry:   cmd.MaxRetry,
+		ID:          cmd.ID,
+		Name:        cmd.Name,
+		CallbackURL: cmd.CallbackURL,
+		RetryCount:  cmd.RetryCount,
+		MaxRetry:    cmd.MaxRetry,
 	}
 	if err := saveDeadTask(ctx, task, errMsg); err != nil {
 		log.Printf("⚠️ 任务[%s] 死信保存失败: %v", cmd.ID, err)
@@ -209,7 +274,7 @@ func saveDeadTask(ctx context.Context, task *model.Task, errMsg string) error {
 	if err := database.RDB.HSet(ctx, detailKey,
 		"id", task.ID,
 		"name", task.Name,
-		"func_name", task.FuncName,
+		"callback_url", task.CallbackURL,
 		"retry_count", task.RetryCount,
 		"error", errMsg,
 		"dead_at", time.Now().Unix(),
@@ -244,28 +309,9 @@ func parseTaskCommand(body []byte) model.TaskCommand {
 		return cmd
 	}
 
-	// 兼容旧版格式
-	var legacy struct {
-		JobID       string `json:"job_id"`
-		TriggerTime int64  `json:"trigger_time"`
-	}
-	if err := json.Unmarshal(body, &legacy); err == nil && legacy.JobID != "" {
-		return model.TaskCommand{
-			ID:          legacy.JobID,
-			Name:        "legacy",
-			FuncName:    "mock_work",
-			TriggerTime: legacy.TriggerTime,
-			Priority:    consts.PriorityLow,
-			MaxRetry:    consts.DefaultMaxRetry,
-			Timeout:     30,
-		}
-	}
-
-	// 纯文本兼容
+	// 兜底：纯文本视为任务 ID（调试用）
 	return model.TaskCommand{
 		ID:       string(body),
-		Name:     "legacy",
-		FuncName: "mock_work",
 		Priority: consts.PriorityLow,
 		MaxRetry: consts.DefaultMaxRetry,
 		Timeout:  30,
@@ -300,14 +346,14 @@ func sendLogToKafka(ctx context.Context, cmd model.TaskCommand, status int, cost
 
 	logData := logPool.Get().(*ExecutionLog)
 	*logData = ExecutionLog{
-		JobID:     cmd.ID,
-		Name:      cmd.Name,
-		FuncName:  cmd.FuncName,
-		Status:    status,
-		CostMs:    costMs,
-		Retry:     cmd.RetryCount,
-		Timestamp: time.Now().Unix(),
-		ErrorMsg:  errMsg,
+		JobID:       cmd.ID,
+		Name:        cmd.Name,
+		CallbackURL: cmd.CallbackURL,
+		Status:      status,
+		CostMs:      costMs,
+		Retry:       cmd.RetryCount,
+		Timestamp:   time.Now().Unix(),
+		ErrorMsg:    errMsg,
 	}
 
 	bytes, err := json.Marshal(logData)
@@ -350,8 +396,17 @@ func nackWithRequeue(msg amqpDelivery) {
 	}
 }
 
-// 随机抖动工具函数（重试时使用）
-func jitterDuration(base time.Duration) time.Duration {
+// backoffDuration 计算重试退避时间（指数退避 + 随机抖动）
+// retry 1: 1s, 2: 2s, 3: 4s, 4: 8s, 5: 16s, max: 30s
+// 加入 0-500ms 随机抖动，避免多任务同时重试导致雪崩
+func backoffDuration(retry int) time.Duration {
+	if retry <= 0 {
+		return 0
+	}
+	backoff := time.Second << (retry - 1)
+	if backoff > 30*time.Second {
+		backoff = 30 * time.Second
+	}
 	jitter := time.Duration(rand.Intn(500)) * time.Millisecond
-	return base + jitter
+	return backoff + jitter
 }

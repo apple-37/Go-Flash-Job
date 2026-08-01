@@ -3,11 +3,12 @@ package core
 import (
 	"container/heap"
 	"context"
-	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
+	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 )
 
@@ -61,8 +62,8 @@ func (p *P) wake() {
 // schedule 调度循环：选择下一个要执行的任务
 // 仿 GMP 调度策略：
 // 1. 优先从本地队列获取
-// 2. 本地空，从全局队列获取一批
-// 3. 全局也空，从其他 P 偷一半
+// 2. 本地空，从其他 P 偷一半（Work Stealing）
+// 注意：P 不再直接访问全局队列，统一由 fetcherLoop 分发
 func (p *P) schedule() *model.Task {
 	// 1. 优先本地队列
 	p.mu.Lock()
@@ -73,13 +74,7 @@ func (p *P) schedule() *model.Task {
 	}
 	p.mu.Unlock()
 
-	// 2. 本地空，从全局队列拿一批
-	if tasks := p.scheduler.fetchFromGlobal(); len(tasks) > 0 {
-		p.PushBatch(tasks[1:]) // 第一个直接返回，其余放本地
-		return tasks[0]
-	}
-
-	// 3. 全局也空，Work Stealing
+	// 2. 本地空，Work Stealing
 	if stolen := p.scheduler.workSteal(p); len(stolen) > 0 {
 		p.PushBatch(stolen[1:])
 		return stolen[0]
@@ -210,6 +205,11 @@ func (p *P) Run(ctx context.Context) {
 
 // executeTask 执行任务：推送 MQ + 状态机切换
 func (p *P) executeTask(ctx context.Context, task *model.Task) {
+	// 埋点：调度延迟 = 当前时间 - 任务触发时间
+	now := time.Now().Unix()
+	metrics.ScheduleLatency.WithLabelValues().Observe(float64(now - task.TriggerTime))
+	metrics.PLocalQueueSize.WithLabelValues(strconv.Itoa(p.ID)).Set(float64(p.LocalLen()))
+
 	// 1. 状态机：READY -> DISPATCHED
 	if err := p.scheduler.fsm.Fire(ctx, EventDispatch, task); err != nil {
 		log.Printf("⚠️ [P%d] FSM DISPATCH 失败 task=%s err=%v", p.ID, task.ID, err)
@@ -230,7 +230,8 @@ func (p *P) executeTask(ctx context.Context, task *model.Task) {
 		log.Printf("⚠️ [P%d] Pending 移除失败 task=%s err=%v", p.ID, task.ID, err)
 	}
 
-	fmt.Printf("⚡ [P%d] 任务 %s 已投递 RabbitMQ\n", p.ID, task.ID)
+	// 埋点：更新本地队列大小
+	metrics.PLocalQueueSize.WithLabelValues(strconv.Itoa(p.ID)).Set(float64(p.LocalLen()))
 }
 
 // Stop 停止 P

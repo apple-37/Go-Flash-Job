@@ -8,6 +8,12 @@ const (
 	ExecDedupeKeyPrefix = "flash_job:exec_dedupe"    // 执行去重键前缀
 	TaskStateKeyPrefix  = "flash_job:task_state"     // 任务状态 Hash 前缀
 
+	// ZSet 分片配置
+	// 将 global_queue 拆成 N 个分片，避免单 ZSet 热点
+	// 分片 key 格式: flash_job:global_queue:0, flash_job:global_queue:1, ...
+	JobShardCount = 16
+	JobShardPrefix = "flash_job:global_queue:" // 注意末尾冒号
+
 	// RabbitMQ Queues
 	TaskQueue = "flash_job:task_commands" // 任务指令队列
 

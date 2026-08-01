@@ -7,22 +7,25 @@ import (
 	"log"
 	"math/rand"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
+	"go-flash-job/pkg/metrics"
 	"go-flash-job/pkg/model"
 	"go-flash-job/pkg/mq"
+	"go-flash-job/pkg/shard"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
 )
 
 const (
-	fetchInterval         = 5 * time.Second
-	preloadWindow         = 10 * time.Second
+	// fetcherLoop tick 间隔：从 5s 降到 200ms，保证调度延迟 < 200ms
+	// 配合 preloadWindow 使用，到期前 1s 就开始拉取
+	fetchInterval         = 200 * time.Millisecond
+	preloadWindow         = 1 * time.Second
 	publishTimeout        = 3 * time.Second
 	maxRetryBackoff       = 30 * time.Second
 	recoverPendingBatch   = 1000
@@ -31,6 +34,17 @@ const (
 	// P 数量（仿 GMP，校招项目简化为 2 个）
 	NumP = 2
 )
+
+// 包级 Lua 脚本：原子地把到期任务从 global 分片转到 pending
+// KEYS[1]=global shard ZSet, KEYS[2]=pending ZSet, ARGV[1]=maxScore
+var fetchExpiredScript = redis.NewScript(`
+	local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
+	for i=1,#items,2 do
+		redis.call('ZADD', KEYS[2], items[i+1], items[i])
+		redis.call('ZREM', KEYS[1], items[i])
+	end
+	return items
+`)
 
 // Scheduler GMP 调度器
 type Scheduler struct {
@@ -146,20 +160,15 @@ func (s *Scheduler) registerFSMHooks() {
 	})
 }
 
-// fetcherLoop 后台拉取全局队列的任务，分发到各 P
+// fetcherLoop 后台拉取所有分片中到期任务，分发到各 P
+// 职责单一：只负责 global_shard_N → pending → P.localQueue
+// 200ms 高频 tick 保证调度延迟 < 200ms
+// 遍历 16 个分片，用 pipeline 减少 RTT
 func (s *Scheduler) fetcherLoop(ctx context.Context) {
 	ticker := time.NewTicker(fetchInterval)
 	defer ticker.Stop()
 
-	// Lua 脚本：原子地把任务从 global 转到 pending
-	luaScript := redis.NewScript(`
-		local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
-		for i=1,#items,2 do
-			redis.call('ZADD', KEYS[2], items[i+1], items[i])
-			redis.call('ZREM', KEYS[1], items[i])
-		end
-		return items
-	`)
+	shardKeys := shard.AllShardKeys()
 
 	for {
 		select {
@@ -169,30 +178,59 @@ func (s *Scheduler) fetcherLoop(ctx context.Context) {
 		}
 
 		maxScore := time.Now().Add(preloadWindow).Unix()
-		result, err := luaScript.Run(ctx, database.RDB, []string{consts.JobZSetKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
-		if err != nil && err != redis.Nil {
-			log.Printf("⚠️ Redis 拉取任务失败: %v", err)
+
+		// 遍历所有分片，用 Lua 原子拉取到期任务
+		var allTasks []*model.Task
+		for _, shardKey := range shardKeys {
+			result, err := fetchExpiredScript.Run(ctx, database.RDB,
+				[]string{shardKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
+			if err != nil && err != redis.Nil {
+				log.Printf("⚠️ Redis 拉取分片 %s 失败: %v", shardKey, err)
+				continue
+			}
+			if len(result) == 0 {
+				continue
+			}
+			if len(result)%2 != 0 {
+				log.Printf("⚠️ 分片 %s 返回了非法任务载荷，len=%d", shardKey, len(result))
+				continue
+			}
+			tasks := s.parseTasks(result)
+			allTasks = append(allTasks, tasks...)
+		}
+
+		// 埋点：更新队列大小（每 5 个 tick 采样一次，减少 Redis 压力）
+		if rand.Intn(5) == 0 {
+			s.updateQueueMetrics(ctx, shardKeys)
+		}
+
+		if len(allTasks) == 0 {
 			continue
 		}
 
-		if len(result) == 0 {
-			continue
-		}
-		if len(result)%2 != 0 {
-			log.Printf("⚠️ Redis 返回了非法任务载荷，len=%d", len(result))
-			continue
-		}
+		s.balanceTasks(allTasks)
+	}
+}
 
-		// 解析任务列表
-		tasks := s.parseTasks(result)
-		if len(tasks) == 0 {
-			continue
+// updateQueueMetrics 更新队列大小指标
+func (s *Scheduler) updateQueueMetrics(ctx context.Context, shardKeys []string) {
+	pipe := database.RDB.Pipeline()
+	cmds := make([]*redis.IntCmd, len(shardKeys))
+	for i, k := range shardKeys {
+		cmds[i] = pipe.ZCard(ctx, k)
+	}
+	_, _ = pipe.Exec(ctx)
+
+	var total int64
+	for _, cmd := range cmds {
+		if n, err := cmd.Result(); err == nil {
+			total += n
 		}
+	}
+	metrics.QueueSize.WithLabelValues("global").Set(float64(total))
 
-		fmt.Printf("📦 [Fetcher] 抢到 %d 个任务，分配到 P\n", len(tasks))
-
-		// 负载均衡：轮询分配到各 P
-		s.balanceTasks(tasks)
+	if n, err := database.RDB.ZCard(ctx, consts.JobPendingZSetKey).Result(); err == nil {
+		metrics.QueueSize.WithLabelValues("pending").Set(float64(n))
 	}
 }
 
@@ -209,42 +247,20 @@ func (s *Scheduler) parseTasks(result []string) []*model.Task {
 			continue
 		}
 
-		// 优先尝试 JSON 解析（新版任务格式）
+		// JSON 格式解析（任务以 model.Task 序列化存储）
 		var task model.Task
-		if err := json.Unmarshal([]byte(memberStr), &task); err == nil && task.ID != "" {
-			task.TriggerTime = triggerTime
-			tasks = append(tasks, &task)
+		if err := json.Unmarshal([]byte(memberStr), &task); err != nil {
+			log.Printf("⚠️ 任务解析失败, member=%s err=%v", memberStr, err)
 			continue
 		}
-
-		// 兼容旧版格式: "job_<id>_<priority>"
-		task = s.parseLegacyTask(memberStr, triggerTime)
+		if task.ID == "" {
+			continue
+		}
+		task.TriggerTime = triggerTime
 		tasks = append(tasks, &task)
 	}
 
 	return tasks
-}
-
-// parseLegacyTask 解析旧版任务格式 "job_<id>_<priority>"
-func (s *Scheduler) parseLegacyTask(memberStr string, triggerTime int64) model.Task {
-	parts := strings.Split(memberStr, "_")
-	priority := consts.PriorityLow
-	jobID := memberStr
-
-	if len(parts) >= 3 {
-		jobID = strings.Join(parts[1:len(parts)-1], "_")
-		priority = parts[len(parts)-1]
-	}
-
-	return model.Task{
-		ID:          jobID,
-		Name:        "legacy_" + jobID,
-		FuncName:    "mock_work",
-		TriggerTime: triggerTime,
-		Priority:    priority,
-		MaxRetry:    consts.DefaultMaxRetry,
-		Timeout:     30,
-	}
 }
 
 // balanceTasks 负载均衡：轮询分配任务到各 P
@@ -260,37 +276,14 @@ func (s *Scheduler) balanceTasks(tasks []*model.Task) {
 	}
 }
 
-// fetchFromGlobal 从全局队列获取任务（P 调用时调用）
-func (s *Scheduler) fetchFromGlobal() []*model.Task {
-	// 简化版：直接通过 ZRANGEBYSCORE 拉取
-	maxScore := time.Now().Add(preloadWindow).Unix()
-
-	// Lua 脚本：原子拉取并转移到 pending
-	luaScript := redis.NewScript(`
-		local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
-		for i=1,#items,2 do
-			redis.call('ZADD', KEYS[2], items[i+1], items[i])
-			redis.call('ZREM', KEYS[1], items[i])
-		end
-		return items
-	`)
-
-	ctx := context.Background()
-	result, err := luaScript.Run(ctx, database.RDB, []string{consts.JobZSetKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
-	if err != nil || len(result) == 0 {
-		return nil
-	}
-
-	return s.parseTasks(result)
-}
-
-// workSteal 从其他 P 偷任务
+// workSteal 从其他 P 偷任务（P 本地空时调用）
 func (s *Scheduler) workSteal(thief *P) []*model.Task {
 	for _, p := range s.ps {
 		if p.ID == thief.ID {
 			continue
 		}
 		if stolen := p.StealHalf(); len(stolen) > 0 {
+			metrics.WorkStealCount.WithLabelValues(strconv.Itoa(thief.ID)).Inc()
 			return stolen
 		}
 	}
@@ -305,7 +298,7 @@ func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
 	cmd := model.TaskCommand{
 		ID:          task.ID,
 		Name:        task.Name,
-		FuncName:    task.FuncName,
+		CallbackURL: task.CallbackURL,
 		TriggerTime: task.TriggerTime,
 		Priority:    task.Priority,
 		RetryCount:  task.RetryCount,
@@ -319,6 +312,8 @@ func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
 		return fmt.Errorf("marshal task command failed: %w", err)
 	}
 
+	// 埋点：MQ publish 耗时
+	start := time.Now()
 	err = mq.RabbitChannel.PublishWithContext(
 		publishCtx,
 		"",
@@ -330,6 +325,8 @@ func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
 			Body:        body,
 		},
 	)
+	metrics.MQPublishDuration.WithLabelValues().Observe(time.Since(start).Seconds())
+
 	if err != nil {
 		return err
 	}
@@ -359,39 +356,52 @@ func (s *Scheduler) backoff(retry int) time.Duration {
 }
 
 // recoverPendingTasks 恢复 pending 队列中的任务（启动时调用）
+// pending 队列是临时队列，回收时按 jobID 路由到对应分片
 func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
-	luaScript := redis.NewScript(`
-		local members = redis.call('ZRANGE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
-		for i=1,#members,2 do
-			redis.call('ZADD', KEYS[2], members[i+1], members[i])
-			redis.call('ZREM', KEYS[1], members[i])
-		end
-		return #members / 2
-	`)
-
-	res, err := luaScript.Run(ctx, database.RDB, []string{consts.JobPendingZSetKey, consts.JobZSetKey}, recoverPendingBatch-1).Int64()
+	// 拉取所有 pending 任务（score <= now，即所有到期或过期的）
+	maxScore := time.Now().Unix()
+	result, err := database.RDB.ZRangeByScore(ctx, consts.JobPendingZSetKey, &redis.ZRangeBy{
+		Min: "0", Max: strconv.FormatInt(maxScore, 10),
+	}).Result()
 	if err != nil && err != redis.Nil {
-		log.Printf("⚠️ pending 任务回收失败: %v", err)
+		log.Printf("⚠️ pending 任务拉取失败: %v", err)
 		return
 	}
-	if res > 0 {
-		log.Printf("♻️ 已回收 %d 条 pending 任务到 global queue", res)
+
+	if len(result) == 0 {
+		return
+	}
+
+	// 按分片批量写回 global
+	pipe := database.RDB.Pipeline()
+	count := 0
+	for _, memberStr := range result {
+		var task model.Task
+		if err := json.Unmarshal([]byte(memberStr), &task); err != nil {
+			continue
+		}
+		pipe.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
+			Score:  float64(task.TriggerTime),
+			Member: memberStr,
+		})
+		pipe.ZRem(ctx, consts.JobPendingZSetKey, memberStr)
+		count++
+	}
+	if count > 0 {
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Printf("⚠️ pending 任务回收 pipeline 失败: %v", err)
+			return
+		}
+		log.Printf("♻️ 已回收 %d 条 pending 任务到分片 global queue", count)
 	}
 }
 
 // recoverStalePendingLoop 定期回收超时的 pending 任务
+// pending 队列中的任务如果超过 2 分钟没被消费，说明 P 挂了或任务卡死
 func (s *Scheduler) recoverStalePendingLoop(ctx context.Context) {
-	ticker := time.NewTicker(fetchInterval)
+	// 5 秒一次，比 fetcherLoop 低频
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
-	luaScript := redis.NewScript(`
-		local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
-		for i=1,#items,2 do
-			redis.call('ZADD', KEYS[2], items[i+1], items[i])
-			redis.call('ZREM', KEYS[1], items[i])
-		end
-		return #items / 2
-	`)
 
 	for {
 		select {
@@ -400,13 +410,35 @@ func (s *Scheduler) recoverStalePendingLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 
+		// 拉取超过 2 分钟的 stale pending 任务
 		deadline := time.Now().Add(-recoverPendingTimeout).Unix()
-		count, err := luaScript.Run(ctx, database.RDB, []string{consts.JobPendingZSetKey, consts.JobZSetKey}, deadline).Int64()
-		if err != nil && err != redis.Nil {
-			log.Printf("⚠️ stale pending 回收失败: %v", err)
+		result, err := database.RDB.ZRangeByScore(ctx, consts.JobPendingZSetKey, &redis.ZRangeBy{
+			Min: "0", Max: strconv.FormatInt(deadline, 10),
+		}).Result()
+		if err != nil || len(result) == 0 {
 			continue
 		}
+
+		// 按分片写回 global
+		pipe := database.RDB.Pipeline()
+		count := 0
+		for _, memberStr := range result {
+			var task model.Task
+			if err := json.Unmarshal([]byte(memberStr), &task); err != nil {
+				continue
+			}
+			pipe.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
+				Score:  float64(time.Now().Unix()), // 立即执行
+				Member: memberStr,
+			})
+			pipe.ZRem(ctx, consts.JobPendingZSetKey, memberStr)
+			count++
+		}
 		if count > 0 {
+			if _, err := pipe.Exec(ctx); err != nil {
+				log.Printf("⚠️ stale pending 回收 pipeline 失败: %v", err)
+				continue
+			}
 			log.Printf("♻️ 回收 %d 条 stale pending 任务", count)
 		}
 	}

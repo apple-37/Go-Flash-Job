@@ -14,9 +14,9 @@ import (
 	"go-flash-job/pkg/mq"
 	"go-flash-job/scheduler/internal/api"
 	"go-flash-job/scheduler/internal/core"
-	"go-flash-job/scheduler/internal/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -40,17 +40,11 @@ func main() {
 	scheduler.Start(ctx)
 	defer scheduler.Stop()
 
-	// 4. 从/data目录加载任务文件
-	jobService := service.NewJobService()
-	if err := jobService.LoadJobsFromFiles(ctx); err != nil {
-		log.Printf("⚠️ 从/data目录加载任务文件失败: %v", err)
-	} else {
-		log.Println("✅ 成功从/data目录加载任务文件")
-	}
-
-	// 5. 启动 HTTP API Server
+	// 4. 启动 HTTP API Server（业务方通过 API 提交任务）
 	r := gin.Default()
 	api.RegisterRoutes(r)
+	// Prometheus metrics endpoint（供 Prometheus / Grafana 抓取）
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	port := config.AppConfig.Server.Port
 	fmt.Printf("🌟 Scheduler HTTP 服务启动于 %s\n", port)
