@@ -58,10 +58,10 @@ func (h TaskHeap) Less(i, j int) bool {
 	return h[i].TriggerTime < h[j].TriggerTime
 }
 func (h TaskHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *TaskHeap) Push(x interface{}) {
+func (h *TaskHeap) Push(x any) {
 	*h = append(*h, x.(*Task))
 }
-func (h *TaskHeap) Pop() interface{} {
+func (h *TaskHeap) Pop() any {
 	old := *h
 	n := len(old)
 	item := old[n-1]

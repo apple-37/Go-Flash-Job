@@ -24,7 +24,7 @@ func NewPool(maxWorkers int) *Pool {
 // Submit 提交一个任务到协程池执行
 func (p *Pool) Submit(task func()) {
 	// 1. 获取令牌 (Token)
-	// 如果 channel 已满，这里会阻塞等待，从而实现对上游的"背压" (Backpressure)
+	// 如果 channel 已满，这里会阻塞等待
 	p.semaphore <- struct{}{}
 	p.wg.Add(1)
 
@@ -42,5 +42,5 @@ func (p *Pool) Submit(task func()) {
 // Wait 等待池中所有任务执行完毕 (用于优雅停机)
 func (p *Pool) Wait() {
 	p.wg.Wait()
-	fmt.Println("🛑 协程池内所有任务已执行完毕")
+	fmt.Println("协程池内所有任务已执行完毕")
 }

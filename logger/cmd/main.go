@@ -27,20 +27,20 @@ type KafkaLogMsg struct {
 }
 
 func main() {
-	fmt.Println("🚀 Go-Flash-Job Logger (日志清洗服务) 正在启动...")
+	fmt.Println("Logger 正在启动...")
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 1. [重构] 加载配置
+	// 1. 加载配置
 	config.InitConfig()
 
-	// 2. [重构] 使用配置初始化数据库和缓冲器
+	// 2. 使用配置初始化数据库和缓冲器
 	database.InitMySQL(config.AppConfig.MySQL.DSN)
 	store.InitLogStorage()
 	defer database.CloseMySQL()
 	defer store.StopLogStorage()
 
-	// 3. [重构] 使用配置启动 Kafka 消费者
+	// 3. 使用配置启动 Kafka 消费者
 	brokers := config.AppConfig.Kafka.Brokers
 	consumer, err := sarama.NewConsumer(brokers, nil)
 	if err != nil {

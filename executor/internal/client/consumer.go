@@ -44,9 +44,6 @@ func StartConsumer(ctx context.Context) {
 	ch := mq.RabbitChannel
 	consumerTag := fmt.Sprintf("executor-%d", time.Now().UnixNano())
 
-	// [核心面试点] QoS (Quality of Service) 设置
-	// PrefetchCount = 50 意味着 RabbitMQ 最多只给这个消费者推送 50 条未经 Ack 的消息。
-	// 如果消费者处理得慢，RabbitMQ 就会停止推送，将消息积压在 MQ 中，保护了 Executor 的内存。
 	err := ch.Qos(
 		50,    // prefetch count
 		0,     // prefetch size

@@ -1,4 +1,3 @@
-// 文件: cmd/scheduler/main.go
 package main
 
 import (
@@ -10,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"go-flash-job/pkg/config" // 引入 config
+	"go-flash-job/pkg/config" 
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/mq"
 	"go-flash-job/scheduler/internal/api"
@@ -21,14 +20,14 @@ import (
 )
 
 func main() {
-	fmt.Println("🚀 Go-Flash-Job Scheduler 正在启动...")
+	fmt.Println("Scheduler 正在启动...")
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 1. [重构] 加载配置
+	// 1. 加载配置
 	config.InitConfig()
 
-	// 2. [重构] 使用配置初始化基础设施
+	// 2. 使用配置初始化基础设施
 	database.InitMySQL(config.AppConfig.MySQL.DSN)
 	database.InitRedis(config.AppConfig.Redis)
 	mq.InitKafka(config.AppConfig.Kafka.Brokers)
@@ -38,7 +37,7 @@ func main() {
 	defer mq.CloseKafka()
 	defer mq.CloseRabbitMQ()
 
-	// 3. 启动核心调度引擎 (不变)
+	// 3. 启动核心调度引擎 
 	dispatcher := core.NewDispatcher()
 	dispatcher.Start(ctx)
 
@@ -50,11 +49,11 @@ func main() {
 		log.Println("✅ 成功从/data目录加载任务文件")
 	}
 
-	// 5. 启动 HTTP API Server (不变)
+	// 5. 启动 HTTP API Server 
 	r := gin.Default()
 	api.RegisterRoutes(r)
 
-	// 5. [重构] 使用配置中的端口
+	// 5. 使用配置中的端口
 	port := config.AppConfig.Server.Port
 	fmt.Printf("🌟 Scheduler HTTP 服务启动于 %s\n", port)
 
