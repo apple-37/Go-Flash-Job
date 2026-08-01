@@ -144,8 +144,12 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 		metrics.JobsExecuted.WithLabelValues("success").Inc()
 		metrics.TaskDuration.WithLabelValues("success").Observe(time.Since(startTime).Seconds())
 		metrics.RetryCount.WithLabelValues().Observe(float64(cmd.RetryCount))
-		_ = updateTaskState(ctx, jobID, model.StatusSuccess)
-		sendLogToKafka(ctx, cmd, 0, cost, "")
+		if err := updateTaskState(ctx, jobID, model.StatusSuccess); err != nil {
+			log.Printf("⚠️ 任务[%s] 状态更新为 SUCCESS 失败: %v", jobID, err)
+		}
+		if err := sendLogToKafka(ctx, cmd, 0, cost, ""); err != nil {
+			log.Printf("⚠️ 任务[%s] 日志发送失败: %v", jobID, err)
+		}
 		ackMsg(currentMsg)
 		return
 	}
@@ -163,6 +167,7 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 
 	// 重试：写回 Redis ZSet，带指数退避延迟，由 scheduler 重新调度
 	// 不再使用 nack(requeue=true)，避免立即重投导致雪崩
+	// member = jobID（保证重试时去重，不会产生多份），详情更新到 Hash
 	backoff := backoffDuration(cmd.RetryCount)
 	retryAt := time.Now().Add(backoff).Unix()
 
@@ -177,11 +182,14 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 		Timeout:     cmd.Timeout,
 		Payload:     cmd.Payload,
 	}
-	taskJSON, _ := json.Marshal(task)
 
+	// 原子写入：ZAdd(jobID) + 更新详情 Hash + 更新活跃索引
+	if err := model.SaveTaskDetail(ctx, database.RDB, task); err != nil {
+		log.Printf("⚠️ 任务[%s] 详情更新失败: %v", jobID, err)
+	}
 	if err := database.RDB.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
 		Score:  float64(retryAt),
-		Member: string(taskJSON),
+		Member: task.ID, // jobID 作 member，RetryCount 变化不影响去重
 	}).Err(); err != nil {
 		// 写回 Redis 失败，降级为 nack requeue（保证至少不丢任务）
 		log.Printf("⚠️ 任务[%s] 重试入队失败，降级为 nack requeue: %v", jobID, err)
@@ -192,8 +200,12 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 	log.Printf("⏰ 任务[%s] 第 %d 次失败，%v 后重试: %v", jobID, cmd.RetryCount, backoff, execErr)
 	metrics.JobsExecuted.WithLabelValues("failed").Inc()
 	metrics.TaskDuration.WithLabelValues("failed").Observe(time.Since(startTime).Seconds())
-	_ = updateTaskState(ctx, jobID, model.StatusRetry)
-	sendLogToKafka(ctx, cmd, 1, cost, execErr.Error())
+	if err := updateTaskState(ctx, jobID, model.StatusRetry); err != nil {
+		log.Printf("⚠️ 任务[%s] 状态更新为 RETRY 失败: %v", jobID, err)
+	}
+	if err := sendLogToKafka(ctx, cmd, 1, cost, execErr.Error()); err != nil {
+		log.Printf("⚠️ 任务[%s] 日志发送失败: %v", jobID, err)
+	}
 	ackMsg(currentMsg) // 任务已写回 Redis，ack 掉 MQ 消息避免无限堆积
 }
 
@@ -259,10 +271,14 @@ func handleTaskDead(ctx context.Context, cmd model.TaskCommand, currentMsg amqpD
 	}
 
 	// 2. 状态机：标记为 DEAD
-	_ = updateTaskState(ctx, cmd.ID, model.StatusDead)
+	if err := updateTaskState(ctx, cmd.ID, model.StatusDead); err != nil {
+		log.Printf("⚠️ 任务[%s] 状态更新为 DEAD 失败: %v", cmd.ID, err)
+	}
 
 	// 3. 发送死信日志
-	sendLogToKafka(ctx, cmd, 2, 0, errMsg)
+	if err := sendLogToKafka(ctx, cmd, 2, 0, errMsg); err != nil {
+		log.Printf("⚠️ 任务[%s] 死信日志发送失败: %v", cmd.ID, err)
+	}
 
 	// 4. Ack 消息（已进入死信，不再重投）
 	ackMsg(currentMsg)
@@ -289,16 +305,29 @@ func saveDeadTask(ctx context.Context, task *model.Task, errMsg string) error {
 	return err
 }
 
-// updateTaskState 更新任务状态到 Redis Hash
+// updateTaskState 更新任务状态到 Redis Hash，并维护活跃/终态索引
 func updateTaskState(ctx context.Context, taskID string, status model.TaskStatus) error {
 	if taskID == "" {
 		return errors.New("empty task id")
 	}
 	key := fmt.Sprintf("%s:%s", consts.TaskStateKeyPrefix, taskID)
-	_, err := database.RDB.HSet(ctx, key,
-		"status", string(status),
-		"updated_at", time.Now().Unix(),
-	).Result()
+	now := time.Now().Unix()
+	pipe := database.RDB.Pipeline()
+	pipe.HSet(ctx, key, "status", string(status), "updated_at", now)
+	// 终态：从 active 移到 terminal；非终态：更新 active 时间戳
+	if status == model.StatusSuccess || status == model.StatusDead {
+		pipe.ZRem(ctx, consts.ActiveTasksKey, taskID)
+		pipe.ZAdd(ctx, consts.TerminalTasksKey, redis.Z{
+			Score:  float64(now),
+			Member: taskID,
+		})
+	} else {
+		pipe.ZAdd(ctx, consts.ActiveTasksKey, redis.Z{
+			Score:  float64(now),
+			Member: taskID,
+		})
+	}
+	_, err := pipe.Exec(ctx)
 	return err
 }
 

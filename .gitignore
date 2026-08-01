@@ -1,13 +1,23 @@
 # 文件: .gitignore
 
-# 忽略所有配置文件
-configs/*.yaml
-# 但是不忽略模板文件
-!configs/*.example.yaml
-
-# 忽略编译产物
+# 编译产物
 *.exe
 go-flash-job
+scheduler/scheduler
+executor/executor
+logger/logger
 
-docs/
+# 配置文件（含密码，不上传）
+config.yaml
+
+# 本地文档（面试谈资，不上传）
+wiki.md
+problem.md
+
+# 日志和运行时数据
+logs/
 data/
+
+# IDE
+.vscode/
+.idea/

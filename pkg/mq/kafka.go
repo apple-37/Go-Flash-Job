@@ -16,7 +16,9 @@ var kafkaCloseOnce sync.Once
 // InitKafka 接收 brokers 列表作为参数
 func InitKafka(brokers []string) {
 	config := sarama.NewConfig()
-	config.Producer.Return.Successes = false
+	// M6: 开启 Successes 确认，配合 Successes() channel 消费
+	// 不开启时 producer 缓冲满了会阻塞 Input() channel，导致日志丢失
+	config.Producer.Return.Successes = true
 	config.Producer.Return.Errors = true
 	config.Producer.RequiredAcks = sarama.WaitForLocal
 	config.Producer.Retry.Max = 5
@@ -31,8 +33,9 @@ func InitKafka(brokers []string) {
 		producer, err = sarama.NewAsyncProducer(brokers, config)
 		if err == nil {
 			KafkaProducer = producer
-			startKafkaErrorDrainer(producer)
-			fmt.Println("✅ Kafka 异步生产者已就绪")
+			// M6: 必须同时消费 Successes() 和 Errors()，否则 channel 满后 producer 阻塞
+			startKafkaDrainer(producer)
+			fmt.Println("✅ Kafka 异步生产者已就绪（含 Successes/Errors 双通道消费）")
 			return
 		}
 
@@ -47,7 +50,17 @@ func InitKafka(brokers []string) {
 	log.Fatalf("❌ Kafka 生产者创建失败，重试后仍失败: %v", err)
 }
 
-func startKafkaErrorDrainer(producer sarama.AsyncProducer) {
+// startKafkaDrainer 消费 Successes 和 Errors channel
+// M6: Return.Successes=true 时必须消费 Successes()，否则 channel 满后 Input() 阻塞
+func startKafkaDrainer(producer sarama.AsyncProducer) {
+	// 消费成功确认（仅 debug 级别，避免日志洪泛）
+	go func() {
+		for msg := range producer.Successes() {
+			_ = msg
+		}
+	}()
+
+	// 消费错误
 	go func() {
 		for err := range producer.Errors() {
 			if err == nil {

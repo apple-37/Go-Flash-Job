@@ -1,142 +1,230 @@
 # Go-Flash-Job
 
-高性能分布式任务调度引擎（微服务版）。
+高性能分布式任务调度引擎，仿 GMP 调度模型，支持 HTTP 回调、重试退避、ZSet 分片、Prometheus 监控。
 
-项目将任务调度、任务执行、日志清洗拆分为三个服务，通过 Redis、RabbitMQ、Kafka、MySQL 串联出完整任务链路，适合学习调度系统与高并发背压设计。
+## 架构总览
 
-## 一、架构总览
-
-- scheduler：调度服务，负责从 Redis 全局队列拉取任务并按时推送到 RabbitMQ。
-- executor：执行服务，负责消费 RabbitMQ 任务并执行（含 Redis 去重与幂等保护），同时把执行日志写入 Kafka。
-- logger：日志服务，负责消费 Kafka 日志并批量落库 MySQL。
-
-任务链路：
-
-1. 任务写入 Redis ZSet（全局调度队列）
-2. scheduler 预拉取任务到本地最小堆并按触发时间推送到 RabbitMQ
-3. executor 消费 RabbitMQ 执行任务，发送日志到 Kafka
-4. logger 消费 Kafka，批量写入 MySQL，并定时清理过期日志
-
-任务消息格式（scheduler -> executor）：
-
-```json
-{
-  "job_id": "seed_job_1",
-  "trigger_time": 1714200000
-}
+```
+┌─────────────┐     ┌──────────────────────────────────────────┐     ┌──────────────┐
+│  Business   │ HTTP│                Scheduler                  │     │   Executor   │
+│  Service    ├────►│  ┌────────┐  ┌─────┐  ┌───────────────┐  │     │              │
+│ (Python/Go) │     │  │  API   │  │ FSM │  │ GMP Scheduler │  │MQ   │  HTTP Callback│
+└─────────────┘     │  │ Limiter│  │     │  │  fetcher + P  ├─┼────►│  ┌──────────┐│
+                    │  └────┬───┘  └─────┘  └───────┬───────┘  │     │  │ Worker   ││
+                    │       │                       │          │     │  │ Pool(50) ││
+                    │       ▼                       ▼          │     │  └────┬─────┘│
+                    │  ┌─────────────────────────────────────┐ │     │       │      │
+                    │  │ Redis: 16 Sharded ZSets + Hash      │◄┼─────┼───────┘      │
+                    │  │ active_tasks / terminal_tasks index │ │     │              │
+                    │  └─────────────────────────────────────┘ │     └──────┬───────┘
+                    └──────────────────────────────────────────┘            │
+                                    │ metrics                                │ Kafka
+                                    ▼                                        ▼
+                            ┌──────────────┐                        ┌──────────────┐
+                            │ Prometheus   │                        │   Logger     │
+                            │  /metrics    │                        │  (file)     │
+                            └──────────────┘                        └──────────────┘
 ```
 
-## 二、技术栈
+### 三大服务
 
-- Go
-- Gin
-- GORM
-- Redis（ZSet）
-- RabbitMQ
-- Kafka
-- MySQL
+| 服务 | 职责 | 端口 |
+|---|---|---|
+| **scheduler** | 从 Redis 分片 ZSet 拉取到期任务，经 GMP 调度推送到 RabbitMQ | 8080 |
+| **executor** | 消费 RabbitMQ，HTTP 回调业务方服务，失败重试退避 | - |
+| **logger** | 消费 Kafka 日志，批量刷盘（100条/批，文件轮转） | - |
 
-## 三、目录结构
+### 任务链路
 
-- scheduler：调度服务
-- executor：执行服务
-- logger：日志服务
-- pkg：公共包（config、database、mq、model、consts）
-- config.yaml：运行配置
-- config.example.yaml：配置示例
-- Makefile：常用命令入口
+1. 业务方 POST `/api/v1/jobs/submit` 提交任务到 scheduler
+2. scheduler 写入 Redis 分片 ZSet（member=jobID）+ detail Hash
+3. fetcherLoop（200ms tick）拉取到期任务，老化提升后分配到 P 本地堆
+4. P 从本地堆取任务，推送到 RabbitMQ，executor 消费
+5. executor HTTP POST 回调业务方 CallbackURL，结果写 Kafka
+6. logger 消费 Kafka 日志，批量写入文件
 
-## 四、运行前准备
+## 技术栈
 
-请先确保以下依赖可用，且与 config.yaml 中地址一致：
+- **语言**: Go 1.21+
+- **存储**: Redis（ZSet 分片 + Hash + Lua 脚本）
+- **消息队列**: RabbitMQ（任务分发）+ Kafka（日志管道）
+- **监控**: Prometheus + Grafana
+- **压测**: JMeter + Mock Python 服务
 
-1. MySQL（默认 127.0.0.1:3306）
-2. Redis（默认 127.0.0.1:6379）
-3. Kafka（默认 127.0.0.1:9092）
-4. RabbitMQ（默认 localhost:5672）
+## 目录结构
 
-## 五、快速开始
+```
+Go-Flash-Job/
+├── scheduler/              # 调度服务
+│   ├── cmd/main.go
+│   └── internal/
+│       ├── api/            # HTTP API + 限流
+│       ├── core/           # GMP 调度核心（scheduler/p/fsm/heap）
+│       └── service/        # 任务提交服务
+├── executor/               # 执行服务
+│   ├── cmd/main.go
+│   └── internal/
+│       ├── client/         # MQ 消费 + HTTP 回调 + 重试退避
+│       └── worker/         # 协程池
+├── logger/                 # 日志服务
+│   ├── cmd/main.go
+│   └── internal/store/     # 批量刷盘 + 文件轮转
+├── pkg/                    # 公共包
+│   ├── config/             # 配置加载 + 校验
+│   ├── consts/             # 常量定义
+│   ├── database/           # Redis 客户端
+│   ├── metrics/            # Prometheus 指标
+│   ├── model/              # 数据模型 + Redis 辅助函数
+│   ├── mq/                 # RabbitMQ + Kafka 客户端
+│   └── shard/              # ZSet 分片路由
+├── benchmark/              # 压测工具
+│   ├── jmeter/             # JMeter 测试计划
+│   ├── mock_service/       # Mock Python 服务
+│   └── submit_tasks.py     # 批量任务生成器
+├── config.example.yaml     # 配置模板
+└── go.mod
+```
 
-在项目根目录执行：
+## 快速开始
 
-1. 同步依赖
+### 1. 环境准备
 
-   make tidy
+```bash
+# Redis
+docker run -d --name redis -p 6379:6379 redis
 
-2. 编译与测试
+# RabbitMQ
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
 
-   make build
-   make test
+# Kafka
+docker run -d --name kafka -p 9092:9092 bitnami/kafka:latest
+```
 
-3. 分别启动三个服务（建议三个终端）
+### 2. 配置
 
-   make run-scheduler
-   make run-executor
-   make run-logger
+```bash
+cp config.example.yaml config.yaml
+# 编辑 config.yaml 填入你的 Redis/RabbitMQ/Kafka 地址
+```
 
-## 六、Makefile 命令
+### 3. 启动服务
 
-- make help：查看全部命令
-- make tidy：整理依赖
-- make fmt：格式化代码
-- make vet：静态检查
-- make test：运行测试
-- make build：编译所有包
-- make run-scheduler：启动调度服务
-- make run-executor：启动执行服务
-- make run-logger：启动日志服务
+```bash
+# 终端 1: 启动 scheduler
+go run scheduler/cmd/main.go
 
-## 七、功能验证
+# 终端 2: 启动 executor
+go run executor/cmd/main.go
 
-scheduler 启动后，可调用压测接口写入测试任务：
+# 终端 3: 启动 mock 业务服务（压测用）
+cd benchmark/mock_service
+pip install fastapi uvicorn
+uvicorn mock_service:app --port 8000
 
-- 方法：POST
-- 路径：/api/v1/jobs/seed
-- 示例：
+# 终端 4: 启动 logger（可选）
+go run logger/cmd/main.go
+```
 
-  http://127.0.0.1:8080/api/v1/jobs/seed?count=100
+### 4. 提交任务
 
-预期结果：
+```bash
+# 单个任务
+curl -X POST http://localhost:8080/api/v1/jobs/submit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "job_001",
+    "name": "crawl_task",
+    "callback_url": "http://localhost:8000/execute",
+    "trigger_time": 5,
+    "priority": "High",
+    "timeout": 30,
+    "payload": {"url": "https://example.com"}
+  }'
 
-1. scheduler 日志显示任务被推送到 RabbitMQ
-2. executor 日志显示任务被消费并执行
-3. logger 日志显示日志被批量落库
+# 批量提交
+curl -X POST http://localhost:8080/api/v1/jobs/batch \
+  -H "Content-Type: application/json" \
+  -d '{"tasks": [...]}'
 
-幂等验证：
+# 或用 Python 脚本
+python benchmark/submit_tasks.py --count 1000
+```
 
-1. 重复投递同一个 job_id + trigger_time 的消息
-2. executor 日志会打印“命中去重键，跳过重复执行”
-3. 同一任务不会重复执行业务逻辑
+### 5. 监控
 
-## 八、可靠性与幂等策略
+```bash
+# Prometheus 指标
+curl http://localhost:8080/metrics | grep flash_
 
-1. 至少一次投递
-   RabbitMQ 手动 Ack；任务消息只有在日志成功入 Kafka 后才 Ack。
+# Mock 服务统计
+curl http://localhost:8000/stats
+```
 
-2. 调度防丢
-   scheduler 从 Redis global queue 原子搬运到 pending queue，成功投递 MQ 后再删除 pending。
+## 核心设计
 
-3. 幂等去重键
-   executor 使用 Redis SetNX 建立去重键：
-   flash_job:exec_dedupe:{job_id}:{trigger_time}
-   TTL 默认 24 小时。
+### GMP 调度模型
 
-4. 重复消息处理
-   若去重键已存在，则直接 Ack 并跳过执行，控制重复副作用。
+- **G (Goroutine)**: 任务协程
+- **M (Machine)**: HTTP 回调执行单元
+- **P (Processor)**: 本地任务堆（2个），work stealing 负载均衡
 
-## 九、设计亮点
+### 调度策略
 
-1. 调度核心无忙等待
-   通过 Redis ZSet + 本地最小堆 + Timer 精准挂起，避免轮询空转。
+三层排序，保证定时精度 + 公平性：
+1. **触发时间优先**（定时任务核心语义）
+2. **同时间按优先级**（High > Medium > Low）
+3. **同优先级按入队时间**（FIFO 兜底）
 
-2. 全链路背压
-   RabbitMQ QoS + executor 协程池共同限制并发，防止瞬时流量压垮服务。
+**老化机制**：Low 任务等待超过 5 分钟自动提升为 High，防止饿死。
 
-3. 批量 I/O 优化
-   Redis Pipeline 批量写入 + logger 批量刷盘，显著降低网络与数据库开销。
+### 重试退避
 
-4. 可靠性保障
-   RabbitMQ 手动 Ack 保证至少一次投递；Kafka 作为日志缓冲总线避免日志丢失。
+失败任务写回 Redis ZSet（不 nack requeue），指数退避 + 随机抖动：
+```
+1s → 2s → 4s → 8s → 16s → 30s（封顶）+ 0~500ms jitter
+```
 
-5. 自动清理机制
-   logger 定时清理过期日志，防止磁盘与表数据无限增长。
+### ZSet 分片
+
+全局队列拆 16 个分片，`SHA1(jobID) % 16` 路由，消除单 ZSet 热点。
+
+### FSM 状态机
+
+Lua CAS 原子状态转换，7 个状态 + 6 个事件：
+```
+PENDING → READY → DISPATCHED → RUNNING → SUCCESS
+                  ↓                ↓
+                RETRY ────────────┘
+                  ↓
+                 DEAD
+```
+
+### 可靠性保障
+
+- **至少一次投递**：RabbitMQ 手动 Ack
+- **幂等去重**：Redis SetNX，key = `jobID:triggerTime`，TTL 24h
+- **任务去重**：ZSet member = jobID，重试时 score 更新而非新增
+- **FSM 恢复**：active_tasks 索引 + 卡死任务监控（2分钟超时）
+- **pending 缓冲**：global → pending → P，崩溃后可恢复
+
+## API 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/v1/jobs/submit` | 提交单个任务 |
+| POST | `/api/v1/jobs/batch` | 批量提交（≤500） |
+| GET | `/metrics` | Prometheus 指标 |
+
+### 限流
+
+令牌桶算法，每 IP 100 QPS，突发 200。
+
+## 压测
+
+```bash
+# JMeter 测试计划
+jmeter -n -t benchmark/jmeter/go-flash-job-benchmark.jmx -l result.jtl
+
+# Mock 服务支持失败率和延迟控制
+curl http://localhost:8000/execute?fail_rate=0.1&delay_ms=100
+```

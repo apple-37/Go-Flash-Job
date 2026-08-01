@@ -7,6 +7,9 @@ const (
 	JobDeadZSetKey      = "flash_job:dead_queue"     // 死信队列 (ZSet)
 	ExecDedupeKeyPrefix = "flash_job:exec_dedupe"    // 执行去重键前缀
 	TaskStateKeyPrefix  = "flash_job:task_state"     // 任务状态 Hash 前缀
+	TaskDetailKeyPrefix = "flash_job:task_detail"    // 任务详情 Hash 前缀（存完整 Task JSON）
+	ActiveTasksKey      = "flash_job:active_tasks"   // 活跃任务索引 ZSet（score=updated_at，非终态任务）
+	TerminalTasksKey    = "flash_job:terminal_tasks" // 终态任务索引 ZSet（score=终态时间，供定时清理）
 
 	// ZSet 分片配置
 	// 将 global_queue 拆成 N 个分片，避免单 ZSet 热点

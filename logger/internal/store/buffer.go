@@ -23,8 +23,8 @@ const (
 )
 
 type LogBuffer struct {
-	buffer     []model.SysJobLog
-	flushQueue chan []model.SysJobLog
+	buffer     []model.JobLog
+	flushQueue chan []model.JobLog
 	stopCh     chan struct{}
 	mu         sync.Mutex
 	wg         sync.WaitGroup
@@ -64,8 +64,8 @@ func InitLogStorage() {
 	}
 
 	globalBuffer = &LogBuffer{
-		buffer:       make([]model.SysJobLog, 0, BatchSize),
-		flushQueue:   make(chan []model.SysJobLog, FlushQueueSize),
+		buffer:       make([]model.JobLog, 0, BatchSize),
+		flushQueue:   make(chan []model.JobLog, FlushQueueSize),
 		stopCh:       make(chan struct{}),
 		dir:          dir,
 		maxSizeBytes: maxSize,
@@ -167,7 +167,7 @@ func (b *LogBuffer) openCurrentFileLocked() error {
 }
 
 // writeBatch 写入一批日志到文件
-func (b *LogBuffer) writeBatch(data []model.SysJobLog) error {
+func (b *LogBuffer) writeBatch(data []model.JobLog) error {
 	b.fileMu.Lock()
 	defer b.fileMu.Unlock()
 
@@ -245,7 +245,7 @@ func StopLogStorage() {
 }
 
 // AddLog 添加日志到缓冲区（非阻塞）
-func AddLog(logEntry model.SysJobLog) {
+func AddLog(logEntry model.JobLog) {
 	if globalBuffer == nil {
 		return
 	}
@@ -265,7 +265,7 @@ func (b *LogBuffer) flushLocked() {
 		return
 	}
 
-	batch := make([]model.SysJobLog, len(b.buffer))
+	batch := make([]model.JobLog, len(b.buffer))
 	copy(batch, b.buffer)
 	b.buffer = b.buffer[:0]
 

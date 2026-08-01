@@ -17,16 +17,16 @@ import (
 	"github.com/IBM/sarama"
 )
 
-// KafkaLogMsg 对应我们在 Executor 发出的 JSON 结构
+// KafkaLogMsg 对应 executor 发出的日志结构
 type KafkaLogMsg struct {
-	JobID     string `json:"job_id"`
-	Name      string `json:"name"`
-	FuncName  string `json:"func_name"`
-	Status    int    `json:"status"`
-	CostMs    int64  `json:"cost_ms"`
-	Retry     int    `json:"retry"`
-	Timestamp int64  `json:"timestamp"`
-	ErrorMsg  string `json:"error_msg"`
+	JobID       string `json:"job_id"`
+	Name        string `json:"name"`
+	CallbackURL string `json:"callback_url"`
+	Status      int    `json:"status"` // 0:成功, 1:失败, 2:死信
+	CostMs      int64  `json:"cost_ms"`
+	Retry       int    `json:"retry"`
+	Timestamp   int64  `json:"timestamp"`
+	ErrorMsg    string `json:"error_msg"`
 }
 
 func main() {
@@ -74,15 +74,15 @@ func main() {
 				continue
 			}
 
-			logEntry := model.SysJobLog{
-				JobID:     logMsg.JobID,
-				Name:      logMsg.Name,
-				FuncName:  logMsg.FuncName,
-				Status:    logMsg.Status,
-				CostMs:    logMsg.CostMs,
-				Retry:     logMsg.Retry,
-				ErrorMsg:  logMsg.ErrorMsg,
-				CreatedAt: time.Unix(logMsg.Timestamp, 0),
+			logEntry := model.JobLog{
+				JobID:       logMsg.JobID,
+				Name:        logMsg.Name,
+				CallbackURL: logMsg.CallbackURL,
+				Status:      logMsg.Status,
+				CostMs:      logMsg.CostMs,
+				Retry:       logMsg.Retry,
+				ErrorMsg:    logMsg.ErrorMsg,
+				CreatedAt:   time.Unix(logMsg.Timestamp, 0),
 			}
 
 			store.AddLog(logEntry)

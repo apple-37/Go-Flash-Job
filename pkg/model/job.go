@@ -24,6 +24,7 @@ type Task struct {
 	MaxRetry     int    `json:"max_retry"`     // 最大重试次数
 	Timeout      int    `json:"timeout"`       // 执行超时（秒）
 	Payload      []byte `json:"payload"`       // 业务参数（JSON），会作为 HTTP body 转发给 CallbackURL
+	EnqueueAt    int64  `json:"enqueue_at"`    // 入队时间戳（秒），用于同优先级 FIFO 兜底
 }
 
 // TaskCommand 是推送到 MQ 的任务消息体。

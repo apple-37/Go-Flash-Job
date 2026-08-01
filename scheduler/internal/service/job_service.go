@@ -48,6 +48,7 @@ func (s *JobService) SubmitJob(ctx context.Context, task *model.Task) error {
 	} else if task.TriggerTime < 1e9 {
 		task.TriggerTime = now + task.TriggerTime
 	}
+	task.EnqueueAt = now
 
 	// 序列化任务
 	taskJSON, err := json.Marshal(task)
@@ -55,14 +56,22 @@ func (s *JobService) SubmitJob(ctx context.Context, task *model.Task) error {
 		return fmt.Errorf("marshal task failed: %w", err)
 	}
 
-	// 写入 Redis 分片 ZSet（score = 触发时间戳）
-	// 按 jobID 哈希分片，避免单 ZSet 热点
+	// 写入 Redis 分片 ZSet（score = 触发时间戳，member = jobID）
+	// jobID 作为 member 保证重试时去重（RetryCount 变化不影响 member）
+	// 完整任务详情存独立 Hash，避免 member 膨胀 + 支持原地更新
 	shardKey := shard.ShardKey(task.ID)
-	if err := database.RDB.ZAdd(ctx, shardKey, redis.Z{
+	pipe := database.RDB.Pipeline()
+	pipe.ZAdd(ctx, shardKey, redis.Z{
 		Score:  float64(task.TriggerTime),
-		Member: string(taskJSON),
-	}).Err(); err != nil {
-		return fmt.Errorf("redis zadd failed: %w", err)
+		Member: task.ID,
+	})
+	pipe.HSet(ctx, model.DetailKey(task.ID), "data", taskJSON)
+	pipe.ZAdd(ctx, consts.ActiveTasksKey, redis.Z{
+		Score:  float64(now),
+		Member: task.ID,
+	})
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("redis pipeline failed: %w", err)
 	}
 
 	log.Printf("✅ 任务已提交: ID=%s Name=%s Priority=%s TriggerAt=%s CallbackURL=%s",
@@ -102,12 +111,18 @@ func (s *JobService) BatchSubmitJobs(ctx context.Context, tasks []model.Task) (i
 		} else if task.TriggerTime < 1e9 {
 			task.TriggerTime = now + task.TriggerTime
 		}
+		task.EnqueueAt = now
 
 		taskJSON, _ := json.Marshal(task)
-		// 按分片写入，避免单 ZSet 热点
+		// member = jobID（去重），详情存 Hash
 		pipe.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
 			Score:  float64(task.TriggerTime),
-			Member: string(taskJSON),
+			Member: task.ID,
+		})
+		pipe.HSet(ctx, model.DetailKey(task.ID), "data", taskJSON)
+		pipe.ZAdd(ctx, consts.ActiveTasksKey, redis.Z{
+			Score:  float64(now),
+			Member: task.ID,
 		})
 		count++
 	}

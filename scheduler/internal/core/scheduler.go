@@ -33,6 +33,10 @@ const (
 
 	// P 数量（仿 GMP，校招项目简化为 2 个）
 	NumP = 2
+
+	// 老化阈值：Low 任务在队列中等待超过 5 分钟，自动提升为 High
+	// 防止低优先级任务被持续到来的高优先级任务饿死
+	agingThreshold = 5 * time.Minute
 )
 
 // 包级 Lua 脚本：原子地把到期任务从 global 分片转到 pending
@@ -208,8 +212,44 @@ func (s *Scheduler) fetcherLoop(ctx context.Context) {
 			continue
 		}
 
+		// 老化机制：Low 任务在队列中等待超过 5 分钟，自动提升为 High
+		// 防止被持续到来的高优先级任务饿死
+		s.applyAging(allTasks)
+
 		s.balanceTasks(allTasks)
 	}
+}
+
+// applyAging 老化提升：超过阈值未执行的 Low 任务提升为 High
+// M5: 持久化到 detail Hash，防止 P 崩溃后老化提升丢失
+func (s *Scheduler) applyAging(tasks []*model.Task) {
+	now := time.Now().Unix()
+	threshold := int64(agingThreshold.Seconds())
+
+	var promoted []*model.Task
+	for _, t := range tasks {
+		if t.Priority == consts.PriorityLow && t.EnqueueAt > 0 && now-t.EnqueueAt > threshold {
+			t.Priority = consts.PriorityHigh
+			promoted = append(promoted, t)
+		}
+	}
+
+	if len(promoted) == 0 {
+		return
+	}
+
+	// M5: 批量写回 detail Hash，持久化优先级提升
+	ctx := context.Background()
+	pipe := database.RDB.Pipeline()
+	for _, t := range promoted {
+		if taskJSON, err := json.Marshal(t); err == nil {
+			pipe.HSet(ctx, model.DetailKey(t.ID), "data", taskJSON)
+		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("⚠️ 老化提升持久化失败: %v", err)
+	}
+	log.Printf("⏫ 老化提升 %d 个 Low 任务为 High", len(promoted))
 }
 
 // updateQueueMetrics 更新队列大小指标
@@ -234,41 +274,69 @@ func (s *Scheduler) updateQueueMetrics(ctx context.Context, shardKeys []string) 
 	}
 }
 
-// parseTasks 解析 Redis 返回的任务列表
-// 任务 ID 格式: "job_<id>_<priority>" 或者完整结构 JSON
+// parseTasks 解析 Redis 返回的 [jobID, score, ...] 列表
+// member 是 jobID（不再包含 JSON），详情通过 HGET 从 task_detail Hash 读取
 func (s *Scheduler) parseTasks(result []string) []*model.Task {
-	var tasks []*model.Task
-
-	for i := 0; i < len(result); i += 2 {
-		memberStr := result[i]
-		triggerTime, parseErr := strconv.ParseInt(result[i+1], 10, 64)
-		if parseErr != nil {
-			log.Printf("⚠️ triggerTime 解析失败, member=%s score=%s err=%v", memberStr, result[i+1], parseErr)
-			continue
-		}
-
-		// JSON 格式解析（任务以 model.Task 序列化存储）
-		var task model.Task
-		if err := json.Unmarshal([]byte(memberStr), &task); err != nil {
-			log.Printf("⚠️ 任务解析失败, member=%s err=%v", memberStr, err)
-			continue
-		}
-		if task.ID == "" {
-			continue
-		}
-		task.TriggerTime = triggerTime
-		tasks = append(tasks, &task)
+	if len(result) == 0 || len(result)%2 != 0 {
+		return nil
 	}
 
+	ctx := context.Background()
+	n := len(result) / 2
+
+	// 收集 (jobID, score) 对
+	type pair struct {
+		jobID  string
+		score  int64
+	}
+	pairs := make([]pair, 0, n)
+	for i := 0; i < len(result); i += 2 {
+		jobID := result[i]
+		score, err := strconv.ParseInt(result[i+1], 10, 64)
+		if err != nil {
+			log.Printf("⚠️ triggerTime 解析失败, jobID=%s score=%s err=%v", jobID, result[i+1], err)
+			continue
+		}
+		pairs = append(pairs, pair{jobID: jobID, score: score})
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+
+	// pipeline 批量 HGET 任务详情，减少 RTT
+	pipe := database.RDB.Pipeline()
+	cmds := make([]*redis.StringCmd, len(pairs))
+	for i, p := range pairs {
+		cmds[i] = pipe.HGet(ctx, model.DetailKey(p.jobID), "data")
+	}
+	_, _ = pipe.Exec(ctx)
+
+	var tasks []*model.Task
+	for i, cmd := range cmds {
+		data, err := cmd.Bytes()
+		if err != nil {
+			log.Printf("⚠️ 任务详情读取失败, jobID=%s err=%v", pairs[i].jobID, err)
+			continue
+		}
+		var task model.Task
+		if err := json.Unmarshal(data, &task); err != nil {
+			log.Printf("⚠️ 任务详情反序列化失败, jobID=%s err=%v", pairs[i].jobID, err)
+			continue
+		}
+		task.TriggerTime = pairs[i].score
+		tasks = append(tasks, &task)
+	}
 	return tasks
 }
 
 // balanceTasks 负载均衡：轮询分配任务到各 P
 func (s *Scheduler) balanceTasks(tasks []*model.Task) {
 	for i, task := range tasks {
-		// 状态机：PENDING -> READY
+		// S2: 状态机 PENDING -> READY，失败时记录但不阻断分发（任务仍需执行）
 		ctx := context.Background()
-		_ = s.fsm.Fire(ctx, EventTrigger, task)
+		if err := s.fsm.Fire(ctx, EventTrigger, task); err != nil {
+			log.Printf("⚠️ [FSM] task=%s Fire(TRIGGER) 失败: %v，仍继续分发", task.ID, err)
+		}
 
 		// 轮询分配到 P
 		pIdx := i % NumP
@@ -313,8 +381,10 @@ func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
 	}
 
 	// 埋点：MQ publish 耗时
+	// M1: 从 Channel 池获取独立 Channel，避免多协程并发 Publish 触发 channel exception
 	start := time.Now()
-	err = mq.RabbitChannel.PublishWithContext(
+	ch := mq.GetPublishChannel()
+	err = ch.PublishWithContext(
 		publishCtx,
 		"",
 		consts.TaskQueue,
@@ -341,6 +411,7 @@ func (s *Scheduler) removeFromPending(ctx context.Context, taskID string) error 
 }
 
 // backoff 计算重试退避时间（指数退避 + 随机抖动）
+// 注：executor/consumer.go 的 backoffDuration 逻辑一致，两者独立维护避免跨包依赖
 func (s *Scheduler) backoff(retry int) time.Duration {
 	if retry <= 0 {
 		return 0
@@ -357,11 +428,13 @@ func (s *Scheduler) backoff(retry int) time.Duration {
 
 // recoverPendingTasks 恢复 pending 队列中的任务（启动时调用）
 // pending 队列是临时队列，回收时按 jobID 路由到对应分片
+// member 是 jobID（不是 JSON），无需反序列化
 func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
-	// 拉取所有 pending 任务（score <= now，即所有到期或过期的）
+	// 拉取所有 pending 任务（score <= now，即所有到期或过期的），分批防止 OOM
 	maxScore := time.Now().Unix()
 	result, err := database.RDB.ZRangeByScore(ctx, consts.JobPendingZSetKey, &redis.ZRangeBy{
 		Min: "0", Max: strconv.FormatInt(maxScore, 10),
+		Count: recoverPendingBatch, // M2: 加 LIMIT 防止一次拉取过多导致 OOM
 	}).Result()
 	if err != nil && err != redis.Nil {
 		log.Printf("⚠️ pending 任务拉取失败: %v", err)
@@ -372,19 +445,16 @@ func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
 		return
 	}
 
-	// 按分片批量写回 global
+	// member 是 jobID，直接按 jobID 路由到分片
 	pipe := database.RDB.Pipeline()
 	count := 0
-	for _, memberStr := range result {
-		var task model.Task
-		if err := json.Unmarshal([]byte(memberStr), &task); err != nil {
-			continue
-		}
-		pipe.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
-			Score:  float64(task.TriggerTime),
-			Member: memberStr,
+	for _, jobID := range result {
+		// 用 jobID 作为 member 写回 global 分片，score=0 立即执行
+		pipe.ZAdd(ctx, shard.ShardKey(jobID), redis.Z{
+			Score:  float64(maxScore), // 立即执行
+			Member: jobID,
 		})
-		pipe.ZRem(ctx, consts.JobPendingZSetKey, memberStr)
+		pipe.ZRem(ctx, consts.JobPendingZSetKey, jobID)
 		count++
 	}
 	if count > 0 {
@@ -410,28 +480,27 @@ func (s *Scheduler) recoverStalePendingLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 
-		// 拉取超过 2 分钟的 stale pending 任务
+		// 拉取超过 2 分钟的 stale pending 任务，分批防止 OOM
 		deadline := time.Now().Add(-recoverPendingTimeout).Unix()
 		result, err := database.RDB.ZRangeByScore(ctx, consts.JobPendingZSetKey, &redis.ZRangeBy{
-			Min: "0", Max: strconv.FormatInt(deadline, 10),
+			Min:   "0",
+			Max:   strconv.FormatInt(deadline, 10),
+			Count: recoverPendingBatch, // M2: 加 LIMIT
 		}).Result()
 		if err != nil || len(result) == 0 {
 			continue
 		}
 
-		// 按分片写回 global
+		// member 是 jobID，直接路由到分片
 		pipe := database.RDB.Pipeline()
 		count := 0
-		for _, memberStr := range result {
-			var task model.Task
-			if err := json.Unmarshal([]byte(memberStr), &task); err != nil {
-				continue
-			}
-			pipe.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
-				Score:  float64(time.Now().Unix()), // 立即执行
-				Member: memberStr,
+		now := time.Now().Unix()
+		for _, jobID := range result {
+			pipe.ZAdd(ctx, shard.ShardKey(jobID), redis.Z{
+				Score:  float64(now), // 立即执行
+				Member: jobID,
 			})
-			pipe.ZRem(ctx, consts.JobPendingZSetKey, memberStr)
+			pipe.ZRem(ctx, consts.JobPendingZSetKey, jobID)
 			count++
 		}
 		if count > 0 {
@@ -470,12 +539,25 @@ func (s *Scheduler) terminalStateCleanerLoop(ctx context.Context) {
 }
 
 // Stop 停止调度器
+// S5: 加 10s 超时保护，避免某个协程卡住导致进程无法退出
 func (s *Scheduler) Stop() {
 	close(s.stopCh)
 	for _, p := range s.ps {
 		p.Stop()
 	}
-	s.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("✅ 调度器已优雅退出")
+	case <-time.After(10 * time.Second):
+		log.Println("⚠️ 调度器优雅退出超时(10s)，强制退出")
+	}
 }
 
 // GetFSM 获取状态机实例（供外部调用）
