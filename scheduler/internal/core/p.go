@@ -204,8 +204,11 @@ func (p *P) Run(ctx context.Context) {
 // executeTask 执行任务：推送 MQ + 状态机切换
 func (p *P) executeTask(ctx context.Context, task *model.Task) {
 	// 1. 状态机：READY -> DISPATCHED
+	// DISPATCH 失败说明状态机错乱（任务可能已被其他协程处理或 recovery 重置），
+	// 跳过 MQ 推送避免重复执行
 	if err := p.scheduler.fsm.Fire(ctx, EventDispatch, task); err != nil {
-		log.Printf("⚠️ [P%d] FSM DISPATCH 失败 task=%s err=%v", p.ID, task.ID, err)
+		log.Printf("⚠️ [P%d] FSM DISPATCH 失败 task=%s err=%v，跳过 MQ 推送", p.ID, task.ID, err)
+		return
 	}
 
 	// 2. 推送到 RabbitMQ

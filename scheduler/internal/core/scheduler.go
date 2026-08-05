@@ -335,10 +335,13 @@ func (s *Scheduler) parseTasks(result []string) []*model.Task {
 // balanceTasks 负载均衡：轮询分配任务到各 P
 func (s *Scheduler) balanceTasks(tasks []*model.Task) {
 	for i, task := range tasks {
-		// S2: 状态机 PENDING -> READY，失败时记录但不阻断分发（任务仍需执行）
+		// S2: 状态机 PENDING -> READY
+		// CAS 失败说明状态被并发修改（任务已被其他协程处理或 recovery 重置），
+		// 跳过分发避免后续 DISPATCH 状态转换非法（PENDING --DISPATCH--> ?）
 		ctx := context.Background()
 		if err := s.fsm.Fire(ctx, EventTrigger, task); err != nil {
-			log.Printf("⚠️ [FSM] task=%s Fire(TRIGGER) 失败: %v，仍继续分发", task.ID, err)
+			log.Printf("⚠️ [FSM] task=%s Fire(TRIGGER) 失败: %v，跳过分发（任务已被其他协程处理）", task.ID, err)
+			continue
 		}
 
 		// 轮询分配到 P

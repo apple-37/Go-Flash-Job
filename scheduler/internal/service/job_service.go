@@ -68,6 +68,18 @@ func (s *JobService) SubmitJob(ctx context.Context, task *model.Task) error {
 		Score:  float64(now),
 		Member: task.ID,
 	})
+	// 初始化任务状态为 PENDING，使后续 CAS 脚本的 HGET 能读到状态匹配成功
+	stateKey := fmt.Sprintf("%s:%s", consts.TaskStateKeyPrefix, task.ID)
+	pipe.HSet(ctx, stateKey,
+		"id", task.ID,
+		"name", task.Name,
+		"callback_url", task.CallbackURL,
+		"status", string(model.StatusPending),
+		"retry_count", task.RetryCount,
+		"max_retry", task.MaxRetry,
+		"trigger_time", task.TriggerTime,
+		"updated_at", now,
+	)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("redis pipeline failed: %w", err)
 	}
@@ -122,6 +134,18 @@ func (s *JobService) BatchSubmitJobs(ctx context.Context, tasks []model.Task) (i
 			Score:  float64(now),
 			Member: task.ID,
 		})
+		// 初始化任务状态为 PENDING（批量提交同样需要）
+		stateKey := fmt.Sprintf("%s:%s", consts.TaskStateKeyPrefix, task.ID)
+		pipe.HSet(ctx, stateKey,
+			"id", task.ID,
+			"name", task.Name,
+			"callback_url", task.CallbackURL,
+			"status", string(model.StatusPending),
+			"retry_count", task.RetryCount,
+			"max_retry", task.MaxRetry,
+			"trigger_time", task.TriggerTime,
+			"updated_at", now,
+		)
 		count++
 	}
 
