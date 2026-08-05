@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -24,15 +25,16 @@ func NewJobHandler() *JobHandler {
 func RegisterRoutes(r *gin.Engine) {
 	h := NewJobHandler()
 
-	// 限流：每个 IP 100 QPS，突发 200
-	// 防止 JMeter 压测时打爆 Redis
-	limiter := NewRateLimiter(100, 200)
+	// 限流分级：按接口语义配置不同配额，令牌桶按 IP 独立计数
+	// 单条接口：100 QPS + 200 突发，防止外部滥用打爆 Redis
+	submitLimiter := NewRateLimiter(100, 200)
+	// 批量接口：2000 QPS + 5000 突发，支持业务方大批量注入任务
+	batchLimiter := NewRateLimiter(2000, 5000)
 
 	v1 := r.Group("/api/v1")
-	v1.Use(limiter.Middleware())
 	{
-		v1.POST("/jobs/submit", h.HandleSubmit)
-		v1.POST("/jobs/batch", h.HandleBatchSubmit)
+		v1.POST("/jobs/submit", submitLimiter.Middleware(), h.HandleSubmit)
+		v1.POST("/jobs/batch", batchLimiter.Middleware(), h.HandleBatchSubmit)
 		v1.GET("/jobs/dead", h.HandleListDead)
 	}
 }
@@ -81,6 +83,7 @@ func (h *JobHandler) HandleBatchSubmit(c *gin.Context) {
 		Tasks []model.Task `json:"tasks"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[BATCH-400] JSON 解析失败: %v, Content-Type: %s", err, c.GetHeader("Content-Type"))
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

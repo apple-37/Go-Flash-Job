@@ -1,5 +1,7 @@
 package model
 
+import "encoding/json"
+
 // TaskStatus 任务状态机状态
 type TaskStatus string
 
@@ -22,9 +24,9 @@ type Task struct {
 	Priority     string `json:"priority"`      // 优先级: High, Medium, Low
 	RetryCount   int    `json:"retry_count"`   // 已重试次数
 	MaxRetry     int    `json:"max_retry"`     // 最大重试次数
-	Timeout      int    `json:"timeout"`       // 执行超时（秒）
-	Payload      []byte `json:"payload"`       // 业务参数（JSON），会作为 HTTP body 转发给 CallbackURL
-	EnqueueAt    int64  `json:"enqueue_at"`    // 入队时间戳（秒），用于同优先级 FIFO 兜底
+	Timeout      int             `json:"timeout"`       // 执行超时（秒）
+	Payload      json.RawMessage `json:"payload"`       // 业务参数（任意 JSON），会作为 HTTP body 转发给 CallbackURL
+	EnqueueAt    int64           `json:"enqueue_at"`    // 入队时间戳（秒），用于同优先级 FIFO 兜底
 }
 
 // TaskCommand 是推送到 MQ 的任务消息体。
@@ -36,8 +38,8 @@ type TaskCommand struct {
 	Priority    string `json:"priority"`
 	RetryCount  int    `json:"retry_count"`
 	MaxRetry    int    `json:"max_retry"`
-	Timeout     int    `json:"timeout"`
-	Payload     []byte `json:"payload"`
+	Timeout     int             `json:"timeout"`
+	Payload     json.RawMessage `json:"payload"`
 }
 
 // TaskState 用于持久化任务状态到 Redis Hash

@@ -60,11 +60,18 @@
         <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
       </ThreadGroup>
       <hashTree>
-        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /api/v1/jobs/submit" enabled="true">
-          <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="用户定义变量" enabled="true">
-            <collectionProp name="Arguments.arguments"/>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="POST /api/v1/jobs/batch" enabled="true">
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                <stringProp name="Argument.value">{"tasks":[{"id":"jmeter_${__threadNum}_${__time(yyyyMMddHHmmssSSS)}","name":"JMeter压测任务","callback_url":"http://${MOCK_HOST}:${MOCK_PORT}/run","trigger_time":1,"priority":"Medium","max_retry":3,"timeout":30,"payload":{"source":"jmeter","thread":"${__threadNum}"}}]}</stringProp>
+                <stringProp name="Argument.metadata">=</stringProp>
+              </elementProp>
+            </collectionProp>
           </elementProp>
-          <stringProp name="HTTPSampler.path">/api/v1/jobs/submit</stringProp>
+          <stringProp name="HTTPSampler.path">/api/v1/jobs/batch</stringProp>
           <stringProp name="HTTPSampler.method">POST</stringProp>
           <boolProp name="HTTPSampler.follow_redirects">true</boolProp>
           <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
@@ -73,21 +80,7 @@
           <stringProp name="HTTPSampler.embedded_url_re"></stringProp>
           <stringProp name="HTTPSampler.connect_timeout"></stringProp>
           <stringProp name="HTTPSampler.response_timeout"></stringProp>
-          <boolProp name="HTTPSampler.BROWSER_COMPATIBLE_MULTIPART">true</boolProp>
-          <stringProp name="HTTPSampler.body_data">{
-  "id": "jmeter_${__threadNum}_${__time(yyyyMMddHHmmssSSS)}",
-  "name": "JMeter压测任务",
-  "callback_url": "http://${MOCK_HOST}:${MOCK_PORT}/run",
-  "trigger_time": 1,
-  "priority": "Medium",
-  "max_retry": 3,
-  "timeout": 30,
-  "payload": {
-    "source": "jmeter",
-    "thread": "${__threadNum}"
-  }
-}</stringProp>
-          <stringProp name="HTTPSampler.BROWSER_COMPATIBLE_MULTIPART">false</stringProp>
+          <boolProp name="HTTPSampler.BROWSER_COMPATIBLE_MULTIPART">false</boolProp>
           <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
           <boolProp name="HTTPSampler.monitor">false</boolProp>
           <stringProp name="HTTPSampler.content_type">application/json</stringProp>
