@@ -21,3 +21,5 @@ data/
 # IDE
 .vscode/
 .idea/
+
+benchmark/mock_service/__pycache__

@@ -1,6 +1,6 @@
 # Go-Flash-Job
 
-高性能分布式任务调度引擎，仿 GMP 调度模型，支持 HTTP 回调、重试退避、ZSet 分片、Prometheus 监控。
+高性能分布式任务调度引擎，仿 GMP 调度模型，支持 HTTP 回调、重试退避、FSM 状态机恢复、Redis 分布式锁选主。
 
 ## 架构总览
 
@@ -14,30 +14,30 @@
                     │       │                       │          │     │  │ Pool(50) ││
                     │       ▼                       ▼          │     │  └────┬─────┘│
                     │  ┌─────────────────────────────────────┐ │     │       │      │
-                    │  │ Redis: 16 Sharded ZSets + Hash      │◄┼─────┼───────┘      │
-                    │  │ active_tasks / terminal_tasks index │ │     │              │
+                    │  │ Redis: ZSet 队列 + Hash 详情         │◄┼─────┼───────┘      │
+                    │  │ active/terminal_tasks 索引 + 选主锁 │ │     │              │
                     │  └─────────────────────────────────────┘ │     └──────┬───────┘
                     └──────────────────────────────────────────┘            │
-                                    │ metrics                                │ Kafka
-                                    ▼                                        ▼
-                            ┌──────────────┐                        ┌──────────────┐
-                            │ Prometheus   │                        │   Logger     │
-                            │  /metrics    │                        │  (file)     │
-                            └──────────────┘                        └──────────────┘
+                                                                     Kafka    │
+                                                                         ▼    │
+                                                                 ┌──────────────┐
+                                                                 │   Logger     │
+                                                                 │  (file)     │
+                                                                 └──────────────┘
 ```
 
 ### 三大服务
 
-| 服务          | 职责                                                        | 端口 |
-| ------------- | ----------------------------------------------------------- | ---- |
-| **scheduler** | 从 Redis 分片 ZSet 拉取到期任务，经 GMP 调度推送到 RabbitMQ | 8080 |
-| **executor**  | 消费 RabbitMQ，HTTP 回调业务方服务，失败重试退避            | -    |
-| **logger**    | 消费 Kafka 日志，批量刷盘（100条/批，文件轮转）             | -    |
+| 服务          | 职责                                                   | 端口 |
+| ------------- | ------------------------------------------------------ | ---- |
+| **scheduler** | 从 Redis ZSet 拉取到期任务，经 GMP 调度推送到 RabbitMQ | 8080 |
+| **executor**  | 消费 RabbitMQ，HTTP 回调业务方服务，失败重试退避       | -    |
+| **logger**    | 消费 Kafka 日志，批量刷盘（100条/批，文件轮转）        | -    |
 
 ### 任务链路
 
 1. 业务方 POST `/api/v1/jobs/submit` 提交任务到 scheduler
-2. scheduler 写入 Redis 分片 ZSet（member=jobID）+ detail Hash
+2. scheduler 写入 Redis ZSet（member=jobID）+ detail Hash
 3. fetcherLoop（200ms tick）拉取到期任务，老化提升后分配到 P 本地堆
 4. P 从本地堆取任务，推送到 RabbitMQ，executor 消费
 5. executor HTTP POST 回调业务方 CallbackURL，结果写 Kafka
@@ -46,7 +46,7 @@
 ## 技术栈
 
 - **语言**: Go 1.21+
-- **存储**: Redis（ZSet 分片 + Hash + Lua 脚本）
+- **存储**: Redis（ZSet + Hash + Lua 脚本 + 分布式锁）
 - **消息队列**: RabbitMQ（任务分发）+ Kafka（日志管道）
 - **压测**: JMeter + Mock Python 服务
 
@@ -73,8 +73,7 @@ Go-Flash-Job/
 │   ├── consts/             # 常量定义
 │   ├── database/           # Redis 客户端
 │   ├── model/              # 数据模型 + Redis 辅助函数
-│   ├── mq/                 # RabbitMQ + Kafka 客户端
-│   └── shard/              # ZSet 分片路由
+│   └── mq/                 # RabbitMQ + Kafka 客户端
 ├── benchmark/              # 压测工具
 │   ├── jmeter/             # JMeter 测试计划
 │   ├── mock_service/       # Mock Python 服务
@@ -148,11 +147,14 @@ curl -X POST http://localhost:8080/api/v1/jobs/batch \
 python benchmark/submit_tasks.py --count 1000
 ```
 
-### 5. 监控
+### 5. 查看统计
 
 ```bash
 # Mock 服务统计
 curl http://localhost:8000/stats
+
+# 死信队列
+curl http://localhost:8080/api/v1/jobs/dead
 ```
 
 ## 核心设计
@@ -181,9 +183,14 @@ curl http://localhost:8000/stats
 1s → 2s → 4s → 8s → 16s → 30s（封顶）+ 0~500ms jitter
 ```
 
-### ZSet 分片
+### 分布式选主
 
-全局队列拆 16 个分片，`SHA1(jobID) % 16` 路由，消除单 ZSet 热点。
+scheduler 通过 Redis 分布式锁实现选主，支持多实例部署：
+
+- **获取锁**：`SET lockKey instanceID NX EX 10`，拿到锁的实例成为 Leader
+- **续期**：后台 goroutine 每 3s 用 Lua CAS 续期（TTL 10s，留 7s 容错）
+- **释放**：优雅退出时用 Lua CAS 释放锁（避免误删别人的锁）
+- **故障接管**：主挂了 10s 后锁过期，backup 自动接管
 
 ### FSM 状态机
 
@@ -207,10 +214,11 @@ PENDING → READY → DISPATCHED → RUNNING → SUCCESS
 
 ## API 接口
 
-| 方法 | 路径                  | 说明             |
-| ---- | --------------------- | ---------------- |
-| POST | `/api/v1/jobs/submit` | 提交单个任务     |
-| POST | `/api/v1/jobs/batch`  | 批量提交（≤500） |
+| 方法 | 路径                  | 说明                 |
+| ---- | --------------------- | -------------------- |
+| POST | `/api/v1/jobs/submit` | 提交单个任务         |
+| POST | `/api/v1/jobs/batch`  | 批量提交（≤10000）   |
+| GET  | `/api/v1/jobs/dead`   | 查看死信队列（分页） |
 
 ### 限流
 

@@ -11,7 +11,6 @@ import (
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
-	"go-flash-job/pkg/shard"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -277,7 +276,7 @@ func (f *FSM) RecoverStaleTasks(ctx context.Context) (int, error) {
 		}
 
 		// member = jobID（P1 修复），详情已在 Hash 中
-		_, err = database.RDB.ZAdd(ctx, shard.ShardKey(jobID), redis.Z{
+		_, err = database.RDB.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 			Score:  float64(task.TriggerTime),
 			Member: jobID,
 		}).Result()
@@ -369,7 +368,7 @@ func (f *FSM) MonitorStaleStates(ctx context.Context, staleTimeout time.Duration
 		}
 
 		// member = jobID
-		_, err = database.RDB.ZAdd(ctx, shard.ShardKey(jobID), redis.Z{
+		_, err = database.RDB.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 			Score:  float64(task.TriggerTime),
 			Member: jobID,
 		}).Result()

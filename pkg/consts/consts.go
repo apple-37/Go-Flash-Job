@@ -10,12 +10,7 @@ const (
 	TaskDetailKeyPrefix = "flash_job:task_detail"    // 任务详情 Hash 前缀（存完整 Task JSON）
 	ActiveTasksKey      = "flash_job:active_tasks"   // 活跃任务索引 ZSet（score=updated_at，非终态任务）
 	TerminalTasksKey    = "flash_job:terminal_tasks" // 终态任务索引 ZSet（score=终态时间，供定时清理）
-
-	// ZSet 分片配置
-	// 将 global_queue 拆成 N 个分片，避免单 ZSet 热点
-	// 分片 key 格式: flash_job:global_queue:0, flash_job:global_queue:1, ...
-	JobShardCount = 16
-	JobShardPrefix = "flash_job:global_queue:" // 注意末尾冒号
+	SchedulerLockKey    = "flash_job:scheduler_lock" // scheduler 选主锁
 
 	// RabbitMQ Queues
 	TaskQueue = "flash_job:task_commands" // 任务指令队列

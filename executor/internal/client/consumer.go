@@ -17,7 +17,6 @@ import (
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
 	"go-flash-job/pkg/mq"
-	"go-flash-job/pkg/shard"
 
 	"github.com/IBM/sarama"
 	"github.com/redis/go-redis/v9"
@@ -181,7 +180,7 @@ func handleTask(ctx context.Context, cmd model.TaskCommand, currentMsg amqpDeliv
 	if err := model.SaveTaskDetail(ctx, database.RDB, task); err != nil {
 		log.Printf("⚠️ 任务[%s] 详情更新失败: %v", jobID, err)
 	}
-	if err := database.RDB.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
+	if err := database.RDB.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 		Score:  float64(retryAt),
 		Member: task.ID, // jobID 作 member，RetryCount 变化不影响去重
 	}).Err(); err != nil {

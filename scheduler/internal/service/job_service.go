@@ -10,7 +10,6 @@ import (
 	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
-	"go-flash-job/pkg/shard"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -56,12 +55,11 @@ func (s *JobService) SubmitJob(ctx context.Context, task *model.Task) error {
 		return fmt.Errorf("marshal task failed: %w", err)
 	}
 
-	// 写入 Redis 分片 ZSet（score = 触发时间戳，member = jobID）
+	// 写入 Redis ZSet（score = 触发时间戳，member = jobID）
 	// jobID 作为 member 保证重试时去重（RetryCount 变化不影响 member）
 	// 完整任务详情存独立 Hash，避免 member 膨胀 + 支持原地更新
-	shardKey := shard.ShardKey(task.ID)
 	pipe := database.RDB.Pipeline()
-	pipe.ZAdd(ctx, shardKey, redis.Z{
+	pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 		Score:  float64(task.TriggerTime),
 		Member: task.ID,
 	})
@@ -115,7 +113,7 @@ func (s *JobService) BatchSubmitJobs(ctx context.Context, tasks []model.Task) (i
 
 		taskJSON, _ := json.Marshal(task)
 		// member = jobID（去重），详情存 Hash
-		pipe.ZAdd(ctx, shard.ShardKey(task.ID), redis.Z{
+		pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 			Score:  float64(task.TriggerTime),
 			Member: task.ID,
 		})

@@ -14,7 +14,6 @@ import (
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
 	"go-flash-job/pkg/mq"
-	"go-flash-job/pkg/shard"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
@@ -38,8 +37,8 @@ const (
 	agingThreshold = 5 * time.Minute
 )
 
-// 包级 Lua 脚本：原子地把到期任务从 global 分片转到 pending
-// KEYS[1]=global shard ZSet, KEYS[2]=pending ZSet, ARGV[1]=maxScore
+// 包级 Lua 脚本：原子地把到期任务从 global 移到 pending
+// KEYS[1]=global ZSet, KEYS[2]=pending ZSet, ARGV[1]=maxScore
 var fetchExpiredScript = redis.NewScript(`
 	local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
 	for i=1,#items,2 do
@@ -51,18 +50,20 @@ var fetchExpiredScript = redis.NewScript(`
 
 // Scheduler GMP 调度器
 type Scheduler struct {
-	ps    []*P
-	fsm   *FSM
-	mu    sync.Mutex
+	ps     []*P
+	fsm    *FSM
+	leader *LeaderElection
+	mu     sync.Mutex
 	stopCh chan struct{}
-	wg    sync.WaitGroup
+	wg     sync.WaitGroup
 }
 
 // NewScheduler 创建调度器
 func NewScheduler() *Scheduler {
 	s := &Scheduler{
-		ps:    make([]*P, NumP),
-		fsm:   NewFSM(),
+		ps:     make([]*P, NumP),
+		fsm:    NewFSM(),
+		leader: NewLeaderElection(),
 		stopCh: make(chan struct{}),
 	}
 
@@ -75,30 +76,65 @@ func NewScheduler() *Scheduler {
 }
 
 // Start 启动调度器
+// 选主循环：拿到锁才调度，失去锁则停所有调度协程并重新选主
+// 这样多实例部署时只有主在调度，主挂了 10s 后 backup 自动接管
 func (s *Scheduler) Start(ctx context.Context) {
 	fmt.Println("🚀 GMP 调度引擎已启动...")
 
-	// 1. 注册 FSM 钩子
+	// 1. 注册 FSM 钩子（不需要锁，任何时候都能做）
 	s.registerFSMHooks()
 
-	// 2. 恢复 pending 队列中的任务（异常退出遗留）
+	// 2. 选主循环
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		lostCh, err := s.leader.WaitForLeadership(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("⚠️ 选主失败: %v，重试", err)
+			continue
+		}
+
+		// 拿到锁，作为 Leader 运行
+		// leadCtx 在 lostCh 关闭（续期失败/主失联）时 cancel，停止所有调度协程
+		leadCtx, cancel := context.WithCancel(ctx)
+		go func() {
+			<-lostCh
+			cancel()
+		}()
+
+		s.runAsLeader(leadCtx)
+		log.Printf("🔄 失去 Leader 身份，重新选主...")
+	}
+}
+
+// runAsLeader 作为 Leader 启动所有调度协程，阻塞直到 leadCtx 取消
+// 失去锁时所有协程退出，避免和新的 Leader 同时调度
+func (s *Scheduler) runAsLeader(ctx context.Context) {
+	// 1. 恢复 pending 队列中的任务（异常退出遗留）
 	s.recoverPendingTasks(ctx)
 
-	// 3. FSM 智能恢复：扫描所有任务状态，重新加入未完成的任务
+	// 2. FSM 智能恢复：扫描所有任务状态，重新加入未完成的任务
 	if count, err := s.fsm.RecoverStaleTasks(ctx); err != nil {
 		log.Printf("⚠️ FSM 智能恢复失败: %v", err)
 	} else if count > 0 {
 		log.Printf("♻️ FSM 智能恢复 %d 个未完成任务", count)
 	}
 
-	// 4. 启动 fetcher 协程（拉取全局任务到本地）
+	// 3. 启动 fetcher 协程（拉取全局任务到本地）
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.fetcherLoop(ctx)
 	}()
 
-	// 5. 启动所有 P
+	// 4. 启动所有 P
 	for i, p := range s.ps {
 		s.wg.Add(1)
 		go func(idx int, pp *P) {
@@ -108,26 +144,29 @@ func (s *Scheduler) Start(ctx context.Context) {
 		}(i, p)
 	}
 
-	// 6. 启动 stale pending 回收协程
+	// 5. 启动 stale pending 回收协程
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.recoverStalePendingLoop(ctx)
 	}()
 
-	// 7. 启动终态清理协程（每小时清理一次）
+	// 6. 启动终态清理协程（每小时清理一次）
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.terminalStateCleanerLoop(ctx)
 	}()
 
-	// 8. 启动卡死任务监控协程（每 30s 扫描一次，超 2 分钟未更新视为卡死）
+	// 7. 启动卡死任务监控协程（每 30s 扫描一次，超 2 分钟未更新视为卡死）
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		s.staleStateMonitorLoop(ctx)
 	}()
+
+	// 等待所有调度协程退出（leadCtx cancel 后）
+	s.wg.Wait()
 }
 
 // staleStateMonitorLoop 监控 DISPATCHED/RUNNING 状态卡死的任务
@@ -163,15 +202,12 @@ func (s *Scheduler) registerFSMHooks() {
 	})
 }
 
-// fetcherLoop 后台拉取所有分片中到期任务，分发到各 P
-// 职责单一：只负责 global_shard_N → pending → P.localQueue
+// fetcherLoop 后台拉取到期任务，分发到各 P
+// 职责单一：只负责 global_queue → pending → P.localQueue
 // 200ms 高频 tick 保证调度延迟 < 200ms
-// 遍历 16 个分片，用 pipeline 减少 RTT
 func (s *Scheduler) fetcherLoop(ctx context.Context) {
 	ticker := time.NewTicker(fetchInterval)
 	defer ticker.Stop()
-
-	shardKeys := shard.AllShardKeys()
 
 	for {
 		select {
@@ -182,35 +218,30 @@ func (s *Scheduler) fetcherLoop(ctx context.Context) {
 
 		maxScore := time.Now().Add(preloadWindow).Unix()
 
-		// 遍历所有分片，用 Lua 原子拉取到期任务
-		var allTasks []*model.Task
-		for _, shardKey := range shardKeys {
-			result, err := fetchExpiredScript.Run(ctx, database.RDB,
-				[]string{shardKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
-			if err != nil && err != redis.Nil {
-				log.Printf("⚠️ Redis 拉取分片 %s 失败: %v", shardKey, err)
-				continue
-			}
-			if len(result) == 0 {
-				continue
-			}
+		// 用 Lua 原子拉取到期任务
+		result, err := fetchExpiredScript.Run(ctx, database.RDB,
+			[]string{consts.JobZSetKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
+		if err != nil && err != redis.Nil {
+			log.Printf("⚠️ Redis 拉取任务失败: %v", err)
+			continue
+		}
+		if len(result) == 0 || len(result)%2 != 0 {
 			if len(result)%2 != 0 {
-				log.Printf("⚠️ 分片 %s 返回了非法任务载荷，len=%d", shardKey, len(result))
-				continue
+				log.Printf("⚠️ 返回了非法任务载荷，len=%d", len(result))
 			}
-			tasks := s.parseTasks(result)
-			allTasks = append(allTasks, tasks...)
+			continue
 		}
 
-		if len(allTasks) == 0 {
+		tasks := s.parseTasks(result)
+		if len(tasks) == 0 {
 			continue
 		}
 
 		// 老化机制：Low 任务在队列中等待超过 5 分钟，自动提升为 High
 		// 防止被持续到来的高优先级任务饿死
-		s.applyAging(allTasks)
+		s.applyAging(tasks)
 
-		s.balanceTasks(allTasks)
+		s.balanceTasks(tasks)
 	}
 }
 
@@ -395,7 +426,7 @@ func (s *Scheduler) backoff(retry int) time.Duration {
 }
 
 // recoverPendingTasks 恢复 pending 队列中的任务（启动时调用）
-// pending 队列是临时队列，回收时按 jobID 路由到对应分片
+// pending 队列是临时队列，回收时直接写回 global queue
 // member 是 jobID（不是 JSON），无需反序列化
 func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
 	// 拉取所有 pending 任务（score <= now，即所有到期或过期的），分批防止 OOM
@@ -413,12 +444,12 @@ func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
 		return
 	}
 
-	// member 是 jobID，直接按 jobID 路由到分片
+	// member 是 jobID，直接写回 global queue
 	pipe := database.RDB.Pipeline()
 	count := 0
 	for _, jobID := range result {
-		// 用 jobID 作为 member 写回 global 分片，score=0 立即执行
-		pipe.ZAdd(ctx, shard.ShardKey(jobID), redis.Z{
+		// 用 jobID 作为 member 写回 global queue，score=now 立即执行
+		pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 			Score:  float64(maxScore), // 立即执行
 			Member: jobID,
 		})
@@ -430,7 +461,7 @@ func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
 			log.Printf("⚠️ pending 任务回收 pipeline 失败: %v", err)
 			return
 		}
-		log.Printf("♻️ 已回收 %d 条 pending 任务到分片 global queue", count)
+		log.Printf("♻️ 已回收 %d 条 pending 任务到 global queue", count)
 	}
 }
 
@@ -459,12 +490,12 @@ func (s *Scheduler) recoverStalePendingLoop(ctx context.Context) {
 			continue
 		}
 
-		// member 是 jobID，直接路由到分片
+		// member 是 jobID，直接写回 global queue
 		pipe := database.RDB.Pipeline()
 		count := 0
 		now := time.Now().Unix()
 		for _, jobID := range result {
-			pipe.ZAdd(ctx, shard.ShardKey(jobID), redis.Z{
+			pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
 				Score:  float64(now), // 立即执行
 				Member: jobID,
 			})
@@ -508,11 +539,16 @@ func (s *Scheduler) terminalStateCleanerLoop(ctx context.Context) {
 
 // Stop 停止调度器
 // S5: 加 10s 超时保护，避免某个协程卡住导致进程无法退出
+// 退出时主动释放 Leader 锁，让 backup 立即接管
 func (s *Scheduler) Stop() {
 	close(s.stopCh)
 	for _, p := range s.ps {
 		p.Stop()
 	}
+
+	// 主动释放 Leader 锁（CAS 释放，避免误删别人的锁）
+	// 即使释放失败，锁也会在 TTL(10s) 后过期，backup 自动接管
+	s.leader.Release(context.Background())
 
 	done := make(chan struct{})
 	go func() {
