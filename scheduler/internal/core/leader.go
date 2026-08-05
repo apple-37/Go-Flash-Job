@@ -43,17 +43,23 @@ var renewScript = redis.NewScript(`
 // LeaderElection 基于 Redis 的分布式锁选主
 // 多个 scheduler 实例只有一个能拿到锁成为主，其余 standby 等待接管
 type LeaderElection struct {
-	instanceID string // 唯一标识（hostname:pid），用于 CAS 校验
+	instanceID string // 唯一标识（hostname:port），用于 CAS 校验和 leader 发现
 	isLeader   bool
 }
 
 // NewLeaderElection 创建选主实例
-func NewLeaderElection() *LeaderElection {
+// instanceID 用 hostname:port 而非 hostname:pid，因为监控器需要从 lock value 解析出可访问的地址
+func NewLeaderElection(port string) *LeaderElection {
 	host, _ := os.Hostname()
-	pid := os.Getpid()
+	// port 形如 ":8080"，去掉冒号前缀拼成 hostname:port
 	return &LeaderElection{
-		instanceID: fmt.Sprintf("%s:%d", host, pid),
+		instanceID: fmt.Sprintf("%s%s", host, port),
 	}
+}
+
+// InstanceID 返回当前实例 ID（供 API 层查询）
+func (le *LeaderElection) InstanceID() string {
+	return le.instanceID
 }
 
 // WaitForLeadership 阻塞直到拿到锁成为主

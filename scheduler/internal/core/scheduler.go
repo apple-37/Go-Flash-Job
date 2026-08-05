@@ -58,12 +58,18 @@ type Scheduler struct {
 	wg     sync.WaitGroup
 }
 
+// Leader 返回 LeaderElection 引用（供 API 层查询实例角色）
+func (s *Scheduler) Leader() *LeaderElection {
+	return s.leader
+}
+
 // NewScheduler 创建调度器
-func NewScheduler() *Scheduler {
+// port 用于构造 leader 的 instanceID（hostname:port），供监控器发现 leader
+func NewScheduler(port string) *Scheduler {
 	s := &Scheduler{
 		ps:     make([]*P, NumP),
 		fsm:    NewFSM(),
-		leader: NewLeaderElection(),
+		leader: NewLeaderElection(port),
 		stopCh: make(chan struct{}),
 	}
 
@@ -570,4 +576,14 @@ func (s *Scheduler) Stop() {
 // GetFSM 获取状态机实例（供外部调用）
 func (s *Scheduler) GetFSM() *FSM {
 	return s.fsm
+}
+
+// LeaderInstanceID 返回当前实例的 instanceID（供 API /status 端点使用）
+func (s *Scheduler) LeaderInstanceID() string {
+	return s.leader.InstanceID()
+}
+
+// IsLeader 返回当前实例是否为 Leader（供 API /status 端点使用）
+func (s *Scheduler) IsLeader() bool {
+	return s.leader.IsLeader()
 }

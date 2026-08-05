@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"go-flash-job/pkg/consts"
+	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
 	"go-flash-job/scheduler/internal/service"
 
@@ -13,17 +15,25 @@ import (
 )
 
 type JobHandler struct {
-	jobSvc *service.JobService
+	jobSvc    *service.JobService
+	scheduler SchedulerStatus
 }
 
-func NewJobHandler() *JobHandler {
+// SchedulerStatus 调度器状态接口（避免 api 包反向依赖 core 包）
+type SchedulerStatus interface {
+	LeaderInstanceID() string
+	IsLeader() bool
+}
+
+func NewJobHandler(s SchedulerStatus) *JobHandler {
 	return &JobHandler{
-		jobSvc: service.NewJobService(),
+		jobSvc:    service.NewJobService(),
+		scheduler: s,
 	}
 }
 
-func RegisterRoutes(r *gin.Engine) {
-	h := NewJobHandler()
+func RegisterRoutes(r *gin.Engine, s SchedulerStatus) {
+	h := NewJobHandler(s)
 
 	// 限流分级：按接口语义配置不同配额，令牌桶按 IP 独立计数
 	// 单条接口：100 QPS + 200 突发，防止外部滥用打爆 Redis
@@ -36,7 +46,20 @@ func RegisterRoutes(r *gin.Engine) {
 		v1.POST("/jobs/submit", submitLimiter.Middleware(), h.HandleSubmit)
 		v1.POST("/jobs/batch", batchLimiter.Middleware(), h.HandleBatchSubmit)
 		v1.GET("/jobs/dead", h.HandleListDead)
+		v1.GET("/status", h.HandleStatus)
 	}
+}
+
+// HandleStatus 返回当前实例角色和 leader 地址
+// 监控器连任意实例查 /status，即可发现当前 leader 在哪个地址
+// 解决“监控器写死 8080、换主后无法监控”的问题
+func (h *JobHandler) HandleStatus(c *gin.Context) {
+	leaderID, _ := database.RDB.Get(c, consts.SchedulerLockKey).Result()
+	c.JSON(http.StatusOK, gin.H{
+		"instance_id": h.scheduler.LeaderInstanceID(),
+		"is_leader":   h.scheduler.IsLeader(),
+		"leader_id":   leaderID, // 为空说明当前无主（选主中）
+	})
 }
 
 // HandleSubmit 提交单个任务

@@ -1,0 +1,103 @@
+@startuml Go-Flash-Job Architecture
+skinparam backgroundColor #FFFFFF
+skinparam component {
+    BackgroundColor<<scheduler>> #E3F2FD
+    BackgroundColor<<executor>>  #FFF3E0
+    BackgroundColor<<logger>>    #F3E5F5
+    BackgroundColor<<redis>>     #FFEBEE
+    BackgroundColor<<mq>>        #E8F5E9
+    BackgroundColor<<monitor>>   #FFFDE7
+    BorderColor #37474F
+    FontName "Segoe UI"
+}
+skinparam arrow {
+    Color #37474F
+    FontName "Segoe UI"
+    FontSize 11
+}
+skinparam note {
+    BackgroundColor #FFFDE7
+    BorderColor #FBC02D
+}
+
+title Go-Flash-Job 分布式任务调度引擎架构
+
+' ========== 业务方 ==========
+actor "Business Service\n(Python/Go)" as Biz
+
+' ========== 监视器 ==========
+component "Monitor\n(监控/告警)" as Monitor <<monitor>>
+
+' ========== Scheduler 包 ==========
+package "Scheduler" <<scheduler>> {
+    rectangle "API Limiter"                  as API
+    rectangle "FSM\n状态机"                 as FSM
+    rectangle "GMP Scheduler\nfetcher + P"  as GMP
+    rectangle "Leader Election\n(选主)"     as Leader
+    rectangle "/api/v1/status\n/jobs/dead"  as StatusAPI
+}
+
+' ========== 中间件层 ==========
+database "Redis\nZSet 队列 + Hash 详情\nactive/terminal_tasks 索引\n选主锁" as Redis <<redis>>
+queue    "RabbitMQ\ntask_queue\n(任务投递通道)"                              as RabbitMQ <<mq>>
+queue    "Kafka\ntask_log\n(任务日志通道)"                                as Kafka <<mq>>
+
+' ========== Executor 包 ==========
+package "Executor" <<executor>> {
+    rectangle "Consumer\n(Channel Pool)" as Consumer
+    rectangle "Worker Pool (50)"         as Worker
+    rectangle "HTTP Callback"            as Callback
+}
+
+' ========== Logger ==========
+component "Logger\n(批量刷盘 → file)" as Logger <<logger>>
+
+' ========== 业务方提交任务 ==========
+Biz -[#1976D2]-> API : HTTP 提交任务
+
+' ========== 监视器 → Scheduler ==========
+Monitor -[#F9A825]-> StatusAPI : GET /api/v1/status\n(发现 Leader + 查死信)
+
+' ========== Scheduler 内部 ==========
+API --> FSM
+API --> Redis   : 写入任务
+FSM --> Redis   : CAS 状态转换
+GMP --> Redis   : 拉取 / 更新任务
+GMP --> FSM     : Fire(TRIGGER/DISPATCH)
+Leader --> Redis : SET NX EX + Lua CAS\n(选主 / 续期)
+
+' ========== Scheduler → RabbitMQ → Executor ==========
+GMP -[#E64A19]-> RabbitMQ : Publish\n(Channel Pool)
+RabbitMQ -[#E64A19]-> Consumer : Consume\n(手动 Ack)
+Consumer --> Worker
+
+' ========== Executor 回调业务方 ==========
+Worker --> Callback
+Callback -[#1976D2]-> Biz : HTTP 回调
+
+' ========== Executor → Kafka → Logger ==========
+Callback -[#6A1B9A]-> Kafka : Produce\n(任务日志)
+Kafka -[#6A1B9A]-> Logger : Consume
+
+' ========== 选主说明 ==========
+note right of Leader
+  scheduler_lock: SET NX EX 10s
+  instanceID = hostname:port
+  3s 续期，失败让出 Leader
+  backup 自动接管
+end note
+
+' ========== 幂等说明 ==========
+note right of Worker
+  Redis SetNX 幂等键
+  24h TTL，防重复执行
+end note
+
+' ========== 监视器说明 ==========
+note left of Monitor
+  监控器连任意实例
+  /status 返回 is_leader + leader_id
+  实现 Leader 切换后自动跟随
+end note
+
+@enduml

@@ -35,15 +35,16 @@ func main() {
 	defer mq.CloseRabbitMQ()
 
 	// 3. 启动 GMP 调度引擎
-	scheduler := core.NewScheduler()
+	// port 需在 NewScheduler 之前读取，用于构造 leader instanceID（hostname:port）
+	port := config.AppConfig.Server.Port
+	scheduler := core.NewScheduler(port)
 	scheduler.Start(ctx)
 	defer scheduler.Stop()
 
 	// 4. 启动 HTTP API Server（业务方通过 API 提交任务）
 	r := gin.Default()
-	api.RegisterRoutes(r)
+	api.RegisterRoutes(r, scheduler)
 
-	port := config.AppConfig.Server.Port
 	fmt.Printf("🌟 Scheduler HTTP 服务启动于 %s\n", port)
 
 	srv := &http.Server{Addr: port, Handler: r}
