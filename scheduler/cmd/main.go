@@ -34,11 +34,11 @@ func main() {
 	defer mq.CloseKafka()
 	defer mq.CloseRabbitMQ()
 
-	// 3. 启动 GMP 调度引擎
-	// port 需在 NewScheduler 之前读取，用于构造 leader instanceID（hostname:port）
+	// 3. 启动 GMP 调度引擎（异步，避免阻塞 HTTP Server 初始化）
+	// Start 内部是 for 循环（选主 + runAsLeader），会阻塞，必须放 goroutine
 	port := config.AppConfig.Server.Port
 	scheduler := core.NewScheduler(port)
-	scheduler.Start(ctx)
+	go scheduler.Start(ctx)
 	defer scheduler.Stop()
 
 	// 4. 启动 HTTP API Server（业务方通过 API 提交任务）
@@ -54,6 +54,7 @@ func main() {
 		}
 	}()
 
+	// 5. 主 goroutine 阻塞等待退出信号
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
