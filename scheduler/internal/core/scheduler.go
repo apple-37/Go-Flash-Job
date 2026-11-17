@@ -2,588 +2,261 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
-	"strconv"
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"go-flash-job/pkg/consts"
-	"go-flash-job/pkg/database"
-	"go-flash-job/pkg/model"
-	"go-flash-job/pkg/mq"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
+	"go-flash-job/pkg/config"
+	"go-flash-job/pkg/database"
+	"go-flash-job/pkg/model"
+	"go-flash-job/pkg/mq"
 )
 
-const (
-	// fetcherLoop tick 间隔：从 5s 降到 200ms，保证调度延迟 < 200ms
-	// 配合 preloadWindow 使用，到期前 1s 就开始拉取
-	fetchInterval         = 200 * time.Millisecond
-	preloadWindow         = 1 * time.Second
-	publishTimeout        = 3 * time.Second
-	maxRetryBackoff       = 30 * time.Second
-	recoverPendingBatch   = 1000
-	recoverPendingTimeout = 2 * time.Minute
-
-	// P 数量（仿 GMP，校招项目简化为 2 个）
-	NumP = 2
-
-	// 老化阈值：Low 任务在队列中等待超过 5 分钟，自动提升为 High
-	// 防止低优先级任务被持续到来的高优先级任务饿死
-	agingThreshold = 5 * time.Minute
-)
-
-// 包级 Lua 脚本：原子地把到期任务从 global 移到 pending
-// KEYS[1]=global ZSet, KEYS[2]=pending ZSet, ARGV[1]=maxScore
-var fetchExpiredScript = redis.NewScript(`
-	local items = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'WITHSCORES')
-	for i=1,#items,2 do
-		redis.call('ZADD', KEYS[2], items[i+1], items[i])
-		redis.call('ZREM', KEYS[1], items[i])
-	end
-	return items
+// The pending score is the lease deadline. A claim token fences late confirms.
+var claimDue = redis.NewScript(`
+ if redis.call('GET',KEYS[3]) ~= ARGV[6] then return {} end
+ local ids=redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',ARGV[1],'LIMIT',0,ARGV[2])
+ local result={}
+ for _,id in ipairs(ids) do
+  local state=ARGV[4]..':'..id
+  local data=redis.call('HGET',ARGV[5]..':'..id,'data')
+  local valid,task=false,nil
+  if data then valid,task=pcall(cjson.decode,data) end
+  if valid and type(task)=='table' and task.id==id then
+   redis.call('HSET',state,'status','READY','claim',ARGV[3],'retry_count',task.retry_count or 0)
+   redis.call('ZADD',KEYS[2],ARGV[1]+60,id)
+   table.insert(result,id)
+   table.insert(result,data)
+  else
+   redis.call('HSET',state,'status','DEAD','error','invalid or missing task detail')
+   redis.call('ZREM',KEYS[4],id)
+   redis.call('ZADD',KEYS[5],ARGV[1],id)
+   redis.call('ZADD',KEYS[6],ARGV[1],id)
+   redis.call('HSET',ARGV[7]..':'..id,'id',id,'error','invalid or missing task detail')
+  end
+  redis.call('ZREM',KEYS[1],id)
+ end
+ return result
 `)
 
-// Scheduler GMP 调度器
+var confirmed = redis.NewScript(`
+ if redis.call('HGET',KEYS[1],'claim') ~= ARGV[2] then return 0 end
+ redis.call('ZREM',KEYS[2],ARGV[1])
+ redis.call('HDEL',KEYS[1],'claim')
+ if redis.call('HGET',KEYS[1],'status')=='READY' then
+  redis.call('HSET',KEYS[1],'status','DISPATCHED')
+ end
+ return 1
+`)
+
+// Sending leases outlive the HTTP timeout. A crashed sender leaves an uncertain
+// external outcome, so expiration records UNKNOWN without retrying the POST.
+var maintain = redis.NewScript(`
+ local now=tonumber(ARGV[1])
+ local statePrefix=ARGV[2]..':'
+ for _,id in ipairs(redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',now,'LIMIT',0,256)) do
+  local state=statePrefix..id
+  local status=redis.call('HGET',state,'status')
+  if status=='READY' or status=='PENDING' or status=='RETRY' or status=='DISPATCHED' then
+   redis.call('HSET',state,'status','PENDING')
+   redis.call('HDEL',state,'claim')
+   redis.call('ZADD',KEYS[2],now,id)
+  end
+  redis.call('ZREM',KEYS[1],id)
+ end
+ for _,id in ipairs(redis.call('ZRANGEBYSCORE',KEYS[3],'-inf',now,'LIMIT',0,256)) do
+  local state=statePrefix..id
+  if redis.call('HGET',state,'status')=='RUNNING' then
+   redis.call('HSET',state,'status','UNKNOWN','updated_at',now,'error','executor lease expired')
+   redis.call('ZREM',KEYS[4],id)
+   redis.call('ZADD',KEYS[5],now,id)
+  end
+  redis.call('ZREM',KEYS[3],id)
+ end
+ for _,id in ipairs(redis.call('ZRANGEBYSCORE',KEYS[5],'-inf',now-86400,'LIMIT',0,256)) do
+  redis.call('DEL',statePrefix..id,ARGV[3]..':'..id,ARGV[4]..':'..id)
+  redis.call('ZREM',KEYS[6],id)
+  redis.call('ZREM',KEYS[5],id)
+ end
+ return 1
+`)
+
 type Scheduler struct {
-	ps     []*P
-	fsm    *FSM
 	leader *LeaderElection
-	mu     sync.Mutex
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	queues atomic.Pointer[readyQueues]
 }
 
-// Leader 返回 LeaderElection 引用（供 API 层查询实例角色）
-func (s *Scheduler) Leader() *LeaderElection {
-	return s.leader
-}
+func NewScheduler(port string) *Scheduler     { return &Scheduler{leader: NewLeaderElection(port)} }
+func (s *Scheduler) IsLeader() bool           { return s.leader.IsLeader() }
+func (s *Scheduler) LeaderInstanceID() string { return s.leader.InstanceID() }
 
-// NewScheduler 创建调度器
-// port 用于构造 leader 的 instanceID（hostname:port），供监控器发现 leader
-func NewScheduler(port string) *Scheduler {
-	s := &Scheduler{
-		ps:     make([]*P, NumP),
-		fsm:    NewFSM(),
-		leader: NewLeaderElection(port),
-		stopCh: make(chan struct{}),
-	}
-
-	// 初始化所有 P
-	for i := 0; i < NumP; i++ {
-		s.ps[i] = NewP(i, s)
-	}
-
-	return s
-}
-
-// Start 启动调度器
-// 选主循环：拿到锁才调度，失去锁则停所有调度协程并重新选主
-// 这样多实例部署时只有主在调度，主挂了 10s 后 backup 自动接管
 func (s *Scheduler) Start(ctx context.Context) {
-	fmt.Println("🚀 GMP 调度引擎已启动...")
-
-	// 1. 注册 FSM 钩子（不需要锁，任何时候都能做）
-	s.registerFSMHooks()
-
-	// 2. 选主循环
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		lostCh, err := s.leader.WaitForLeadership(ctx)
+	for ctx.Err() == nil {
+		lost, err := s.leader.WaitForLeadership(ctx)
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️ 选主失败: %v，重试", err)
-			continue
+			return
 		}
-
-		// 拿到锁，作为 Leader 运行
-		// leadCtx 在 lostCh 关闭（续期失败/主失联）时 cancel，停止所有调度协程
-		leadCtx, cancel := context.WithCancel(ctx)
+		leaderCtx, cancel := context.WithCancel(ctx)
 		go func() {
-			<-lostCh
-			cancel()
-		}()
-
-		s.runAsLeader(leadCtx)
-		log.Printf("🔄 失去 Leader 身份，重新选主...")
-	}
-}
-
-// runAsLeader 作为 Leader 启动所有调度协程，阻塞直到 leadCtx 取消
-// 失去锁时所有协程退出，避免和新的 Leader 同时调度
-func (s *Scheduler) runAsLeader(ctx context.Context) {
-	// 1. 恢复 pending 队列中的任务（异常退出遗留）
-	s.recoverPendingTasks(ctx)
-
-	// 2. FSM 智能恢复：扫描所有任务状态，重新加入未完成的任务
-	if count, err := s.fsm.RecoverStaleTasks(ctx); err != nil {
-		log.Printf("⚠️ FSM 智能恢复失败: %v", err)
-	} else if count > 0 {
-		log.Printf("♻️ FSM 智能恢复 %d 个未完成任务", count)
-	}
-
-	// 3. 启动 fetcher 协程（拉取全局任务到本地）
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.fetcherLoop(ctx)
-	}()
-
-	// 4. 启动所有 P
-	for i, p := range s.ps {
-		s.wg.Add(1)
-		go func(idx int, pp *P) {
-			defer s.wg.Done()
-			pp.Run(ctx)
-			log.Printf("🛑 P%d 已退出", idx)
-		}(i, p)
-	}
-
-	// 5. 启动 stale pending 回收协程
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.recoverStalePendingLoop(ctx)
-	}()
-
-	// 6. 启动终态清理协程（每小时清理一次）
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.terminalStateCleanerLoop(ctx)
-	}()
-
-	// 7. 启动卡死任务监控协程（每 30s 扫描一次，超 2 分钟未更新视为卡死）
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.staleStateMonitorLoop(ctx)
-	}()
-
-	// 等待所有调度协程退出（leadCtx cancel 后）
-	s.wg.Wait()
-}
-
-// staleStateMonitorLoop 监控 DISPATCHED/RUNNING 状态卡死的任务
-func (s *Scheduler) staleStateMonitorLoop(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	const staleTimeout = 2 * time.Minute
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		count, err := s.fsm.MonitorStaleStates(ctx, staleTimeout)
-		if err != nil {
-			log.Printf("⚠️ 卡死任务监控失败: %v", err)
-			continue
-		}
-		if count > 0 {
-			log.Printf("⏰ 检测到 %d 个卡死任务，已重新入队", count)
-		}
-	}
-}
-
-// registerFSMHooks 注册状态机钩子
-func (s *Scheduler) registerFSMHooks() {
-	// 死信状态钩子
-	s.fsm.RegisterHook(model.StatusDead, func(ctx context.Context, task *model.Task) error {
-		return SaveDeadTask(ctx, task, "max retry exhausted")
-	})
-}
-
-// fetcherLoop 后台拉取到期任务，分发到各 P
-// 职责单一：只负责 global_queue → pending → P.localQueue
-// 200ms 高频 tick 保证调度延迟 < 200ms
-func (s *Scheduler) fetcherLoop(ctx context.Context) {
-	ticker := time.NewTicker(fetchInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		maxScore := time.Now().Add(preloadWindow).Unix()
-
-		// 用 Lua 原子拉取到期任务
-		result, err := fetchExpiredScript.Run(ctx, database.RDB,
-			[]string{consts.JobZSetKey, consts.JobPendingZSetKey}, maxScore).StringSlice()
-		if err != nil && err != redis.Nil {
-			log.Printf("⚠️ Redis 拉取任务失败: %v", err)
-			continue
-		}
-		if len(result) == 0 || len(result)%2 != 0 {
-			if len(result)%2 != 0 {
-				log.Printf("⚠️ 返回了非法任务载荷，len=%d", len(result))
+			select {
+			case <-lost:
+				cancel()
+			case <-leaderCtx.Done():
 			}
-			continue
-		}
-
-		tasks := s.parseTasks(result)
-		if len(tasks) == 0 {
-			continue
-		}
-
-		// 老化机制：Low 任务在队列中等待超过 5 分钟，自动提升为 High
-		// 防止被持续到来的高优先级任务饿死
-		s.applyAging(tasks)
-
-		s.balanceTasks(tasks)
+		}()
+		s.run(leaderCtx)
+		cancel()
+		<-lost
 	}
 }
 
-// applyAging 老化提升：超过阈值未执行的 Low 任务提升为 High
-// M5: 持久化到 detail Hash，防止 P 崩溃后老化提升丢失
-func (s *Scheduler) applyAging(tasks []*model.Task) {
-	now := time.Now().Unix()
-	threshold := int64(agingThreshold.Seconds())
-
-	var promoted []*model.Task
-	for _, t := range tasks {
-		if t.Priority == consts.PriorityLow && t.EnqueueAt > 0 && now-t.EnqueueAt > threshold {
-			t.Priority = consts.PriorityHigh
-			promoted = append(promoted, t)
+func (s *Scheduler) run(ctx context.Context) {
+	q := newQueues(config.AppConfig.Scheduler)
+	s.queues.Store(q)
+	defer s.queues.Store(nil)
+	var workers sync.WaitGroup
+	for id := range q.local {
+		workers.Add(1)
+		go func() { defer workers.Done(); publishLoop(ctx, q, id) }()
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	nextMaintenance := time.Time{}
+	for ctx.Err() == nil {
+		now := time.Now()
+		if !now.Before(nextMaintenance) {
+			keys := []string{database.JobPendingZSetKey, database.JobZSetKey, database.SendingKey, database.ActiveTasksKey, database.TerminalTasksKey, database.JobDeadZSetKey}
+			if err := maintain.Run(ctx, database.RDB, keys, now.Unix(), database.TaskStateKeyPrefix, database.TaskDetailKeyPrefix, database.DeadDetailKeyPrefix).Err(); err != nil {
+				log.Print(err)
+			}
+			nextMaintenance = now.Add(time.Second)
+		}
+		limit := min(128, q.space())
+		if limit > 0 {
+			token := rand.Text()
+			keys := []string{database.JobZSetKey, database.JobPendingZSetKey, database.SchedulerLockKey, database.ActiveTasksKey, database.TerminalTasksKey, database.JobDeadZSetKey}
+			rows, err := claimDue.Run(ctx, database.RDB, keys, now.Unix(), limit, token, database.TaskStateKeyPrefix, database.TaskDetailKeyPrefix, s.leader.InstanceID(), database.DeadDetailKeyPrefix).StringSlice()
+			if err != nil {
+				log.Print(err)
+			} else if len(rows) > 0 {
+				var batch []delivery
+				for i := 0; i+1 < len(rows); i += 2 {
+					var t model.Task
+					if err := json.Unmarshal([]byte(rows[i+1]), &t); err != nil || t.ID != rows[i] {
+						log.Printf("invalid task detail id=%q", rows[i])
+						continue
+					}
+					batch = append(batch, delivery{task: t, claim: token})
+				}
+				q.push(batch)
+				if len(rows) == 2*limit {
+					continue
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
 		}
 	}
-
-	if len(promoted) == 0 {
-		return
-	}
-
-	// M5: 批量写回 detail Hash，持久化优先级提升
-	ctx := context.Background()
-	pipe := database.RDB.Pipeline()
-	for _, t := range promoted {
-		if taskJSON, err := json.Marshal(t); err == nil {
-			pipe.HSet(ctx, model.DetailKey(t.ID), "data", taskJSON)
-		}
-	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		log.Printf("⚠️ 老化提升持久化失败: %v", err)
-	}
-	log.Printf("⏫ 老化提升 %d 个 Low 任务为 High", len(promoted))
+	q.close()
+	workers.Wait()
 }
 
-// parseTasks 解析 Redis 返回的 [jobID, score, ...] 列表
-// member 是 jobID（不再包含 JSON），详情通过 HGET 从 task_detail Hash 读取
-func (s *Scheduler) parseTasks(result []string) []*model.Task {
-	if len(result) == 0 || len(result)%2 != 0 {
-		return nil
-	}
-
-	ctx := context.Background()
-	n := len(result) / 2
-
-	// 收集 (jobID, score) 对
-	type pair struct {
-		jobID  string
-		score  int64
-	}
-	pairs := make([]pair, 0, n)
-	for i := 0; i < len(result); i += 2 {
-		jobID := result[i]
-		score, err := strconv.ParseInt(result[i+1], 10, 64)
+// Each worker owns one channel and at most one outstanding broker confirmation.
+func publishLoop(ctx context.Context, q *readyQueues, id int) {
+	var ch *amqp.Channel
+	var acks <-chan amqp.Confirmation
+	var returns <-chan amqp.Return
+	defer func() {
+		if ch != nil {
+			_ = ch.Close()
+		}
+	}()
+	for ctx.Err() == nil {
+		if ch == nil {
+			var err error
+			ch, err = mq.RabbitConn.Channel()
+			if err == nil {
+				err = ch.Confirm(false)
+			}
+			if err != nil {
+				if ch != nil {
+					_ = ch.Close()
+					ch = nil
+				}
+				log.Printf("publisher %d: %v", id, err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+			returns = ch.NotifyReturn(make(chan amqp.Return, 1))
+			acks = ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+		}
+		d, ok := q.take(id)
+		if !ok || ctx.Err() != nil {
+			return
+		}
+		err := publish(ctx, ch, acks, returns, d.task)
 		if err != nil {
-			log.Printf("⚠️ triggerTime 解析失败, jobID=%s score=%s err=%v", jobID, result[i+1], err)
-			continue
+			log.Printf("publish id=%s: %v", d.task.ID, err)
+			_ = ch.Close()
+			ch = nil
+			continue // the Redis lease makes this claim eligible for redelivery
 		}
-		pairs = append(pairs, pair{jobID: jobID, score: score})
-	}
-	if len(pairs) == 0 {
-		return nil
-	}
-
-	// pipeline 批量 HGET 任务详情，减少 RTT
-	pipe := database.RDB.Pipeline()
-	cmds := make([]*redis.StringCmd, len(pairs))
-	for i, p := range pairs {
-		cmds[i] = pipe.HGet(ctx, model.DetailKey(p.jobID), "data")
-	}
-	_, _ = pipe.Exec(ctx)
-
-	var tasks []*model.Task
-	for i, cmd := range cmds {
-		data, err := cmd.Bytes()
-		if err != nil {
-			log.Printf("⚠️ 任务详情读取失败, jobID=%s err=%v", pairs[i].jobID, err)
-			continue
+		lag := time.Now().UnixMilli() - d.task.TriggerTime*1000
+		slog.Info("broker_confirm", "job_id", d.task.ID, "attempt", d.task.RetryCount, "dispatch_lag_ms", lag)
+		keys := []string{database.StateKey(d.task.ID), database.JobPendingZSetKey}
+		if err := confirmed.Run(ctx, database.RDB, keys, d.task.ID, d.claim).Err(); err != nil {
+			log.Print(err)
 		}
-		var task model.Task
-		if err := json.Unmarshal(data, &task); err != nil {
-			log.Printf("⚠️ 任务详情反序列化失败, jobID=%s err=%v", pairs[i].jobID, err)
-			continue
-		}
-		task.TriggerTime = pairs[i].score
-		tasks = append(tasks, &task)
-	}
-	return tasks
-}
-
-// balanceTasks 负载均衡：轮询分配任务到各 P
-func (s *Scheduler) balanceTasks(tasks []*model.Task) {
-	for i, task := range tasks {
-		// S2: 状态机 PENDING -> READY
-		// CAS 失败说明状态被并发修改（任务已被其他协程处理或 recovery 重置），
-		// 跳过分发避免后续 DISPATCH 状态转换非法（PENDING --DISPATCH--> ?）
-		ctx := context.Background()
-		if err := s.fsm.Fire(ctx, EventTrigger, task); err != nil {
-			log.Printf("⚠️ [FSM] task=%s Fire(TRIGGER) 失败: %v，跳过分发（任务已被其他协程处理）", task.ID, err)
-			continue
-		}
-
-		// 轮询分配到 P
-		pIdx := i % NumP
-		s.ps[pIdx].Push(task)
 	}
 }
 
-// workSteal 从其他 P 偷任务（P 本地空时调用）
-func (s *Scheduler) workSteal(thief *P) []*model.Task {
-	for _, p := range s.ps {
-		if p.ID == thief.ID {
-			continue
-		}
-		if stolen := p.StealHalf(); len(stolen) > 0 {
-			return stolen
-		}
-	}
-	return nil
-}
-
-// publishToMQ 推送任务到 RabbitMQ
-func (s *Scheduler) publishToMQ(ctx context.Context, task *model.Task) error {
-	publishCtx, cancel := context.WithTimeout(ctx, publishTimeout)
-	defer cancel()
-
-	cmd := model.TaskCommand{
-		ID:          task.ID,
-		Name:        task.Name,
-		CallbackURL: task.CallbackURL,
-		TriggerTime: task.TriggerTime,
-		Priority:    task.Priority,
-		RetryCount:  task.RetryCount,
-		MaxRetry:    task.MaxRetry,
-		Timeout:     task.Timeout,
-		Payload:     task.Payload,
-	}
-
-	body, err := json.Marshal(cmd)
-	if err != nil {
-		return fmt.Errorf("marshal task command failed: %w", err)
-	}
-
-	// M1: 从 Channel 池获取独立 Channel，避免多协程并发 Publish 触发 channel exception
-	ch := mq.GetPublishChannel()
-	err = ch.PublishWithContext(
-		publishCtx,
-		"",
-		consts.TaskQueue,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-		},
-	)
-
+func publish(ctx context.Context, ch *amqp.Channel, acks <-chan amqp.Confirmation, returns <-chan amqp.Return, t model.Task) error {
+	body, err := json.Marshal(t)
 	if err != nil {
 		return err
 	}
-
-	return nil
-}
-
-// removeFromPending 从 Pending 队列移除任务
-func (s *Scheduler) removeFromPending(ctx context.Context, taskID string) error {
-	_, err := database.RDB.ZRem(ctx, consts.JobPendingZSetKey, taskID).Result()
-	return err
-}
-
-// backoff 计算重试退避时间（指数退避 + 随机抖动）
-// 注：executor/consumer.go 的 backoffDuration 逻辑一致，两者独立维护避免跨包依赖
-func (s *Scheduler) backoff(retry int) time.Duration {
-	if retry <= 0 {
-		return 0
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	err = ch.PublishWithContext(ctx, "", mq.TaskQueue, true, false, amqp.Publishing{
+		DeliveryMode: amqp.Persistent, ContentType: "application/json", MessageId: t.ID, Body: body,
+	})
+	if err != nil {
+		return err
 	}
-	// 指数退避：1s, 2s, 4s, 8s, 16s, max 30s
-	backoff := time.Second << (retry - 1)
-	if backoff > maxRetryBackoff {
-		backoff = maxRetryBackoff
-	}
-	// 加入随机抖动（0-500ms），避免雪崩
-	jitter := time.Duration(rand.Intn(500)) * time.Millisecond
-	return backoff + jitter
-}
-
-// recoverPendingTasks 恢复 pending 队列中的任务（启动时调用）
-// pending 队列是临时队列，回收时直接写回 global queue
-// member 是 jobID（不是 JSON），无需反序列化
-func (s *Scheduler) recoverPendingTasks(ctx context.Context) {
-	// 拉取所有 pending 任务（score <= now，即所有到期或过期的），分批防止 OOM
-	maxScore := time.Now().Unix()
-	result, err := database.RDB.ZRangeByScore(ctx, consts.JobPendingZSetKey, &redis.ZRangeBy{
-		Min: "0", Max: strconv.FormatInt(maxScore, 10),
-		Count: recoverPendingBatch, // M2: 加 LIMIT 防止一次拉取过多导致 OOM
-	}).Result()
-	if err != nil && err != redis.Nil {
-		log.Printf("⚠️ pending 任务拉取失败: %v", err)
-		return
-	}
-
-	if len(result) == 0 {
-		return
-	}
-
-	// member 是 jobID，直接写回 global queue
-	pipe := database.RDB.Pipeline()
-	count := 0
-	for _, jobID := range result {
-		// 用 jobID 作为 member 写回 global queue，score=now 立即执行
-		pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
-			Score:  float64(maxScore), // 立即执行
-			Member: jobID,
-		})
-		pipe.ZRem(ctx, consts.JobPendingZSetKey, jobID)
-		count++
-	}
-	if count > 0 {
-		if _, err := pipe.Exec(ctx); err != nil {
-			log.Printf("⚠️ pending 任务回收 pipeline 失败: %v", err)
-			return
-		}
-		log.Printf("♻️ 已回收 %d 条 pending 任务到 global queue", count)
-	}
-}
-
-// recoverStalePendingLoop 定期回收超时的 pending 任务
-// pending 队列中的任务如果超过 2 分钟没被消费，说明 P 挂了或任务卡死
-func (s *Scheduler) recoverStalePendingLoop(ctx context.Context) {
-	// 5 秒一次，比 fetcherLoop 低频
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		// 拉取超过 2 分钟的 stale pending 任务，分批防止 OOM
-		deadline := time.Now().Add(-recoverPendingTimeout).Unix()
-		result, err := database.RDB.ZRangeByScore(ctx, consts.JobPendingZSetKey, &redis.ZRangeBy{
-			Min:   "0",
-			Max:   strconv.FormatInt(deadline, 10),
-			Count: recoverPendingBatch, // M2: 加 LIMIT
-		}).Result()
-		if err != nil || len(result) == 0 {
-			continue
-		}
-
-		// member 是 jobID，直接写回 global queue
-		pipe := database.RDB.Pipeline()
-		count := 0
-		now := time.Now().Unix()
-		for _, jobID := range result {
-			pipe.ZAdd(ctx, consts.JobZSetKey, redis.Z{
-				Score:  float64(now), // 立即执行
-				Member: jobID,
-			})
-			pipe.ZRem(ctx, consts.JobPendingZSetKey, jobID)
-			count++
-		}
-		if count > 0 {
-			if _, err := pipe.Exec(ctx); err != nil {
-				log.Printf("⚠️ stale pending 回收 pipeline 失败: %v", err)
-				continue
-			}
-			log.Printf("♻️ 回收 %d 条 stale pending 任务", count)
-		}
-	}
-}
-
-// terminalStateCleanerLoop 定期清理 1 小时前的终态任务记录（节省 Redis 内存）
-func (s *Scheduler) terminalStateCleanerLoop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		// 清理 1 小时前的 SUCCESS/DEAD 状态记录
-		threshold := time.Now().Add(-1 * time.Hour).Unix()
-		count, err := s.fsm.CleanTerminalStates(ctx, threshold)
-		if err != nil {
-			log.Printf("⚠️ 终态清理失败: %v", err)
-			continue
-		}
-		if count > 0 {
-			log.Printf("🧹 清理 %d 条终态任务状态记录", count)
-		}
-	}
-}
-
-// Stop 停止调度器
-// S5: 加 10s 超时保护，避免某个协程卡住导致进程无法退出
-// 退出时主动释放 Leader 锁，让 backup 立即接管
-func (s *Scheduler) Stop() {
-	close(s.stopCh)
-	for _, p := range s.ps {
-		p.Stop()
-	}
-
-	// 主动释放 Leader 锁（CAS 释放，避免误删别人的锁）
-	// 即使释放失败，锁也会在 TTL(10s) 后过期，backup 自动接管
-	s.leader.Release(context.Background())
-
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
 	select {
-	case <-done:
-		log.Println("✅ 调度器已优雅退出")
-	case <-time.After(10 * time.Second):
-		log.Println("⚠️ 调度器优雅退出超时(10s)，强制退出")
+	case ack, ok := <-acks:
+		if !ok || !ack.Ack {
+			return fmt.Errorf("broker confirmation failed")
+		}
+		select {
+		case <-returns:
+			return fmt.Errorf("unroutable task")
+		default:
+			return nil
+		}
+	case <-returns:
+		return fmt.Errorf("unroutable task")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// GetFSM 获取状态机实例（供外部调用）
-func (s *Scheduler) GetFSM() *FSM {
-	return s.fsm
-}
-
-// LeaderInstanceID 返回当前实例的 instanceID（供 API /status 端点使用）
-func (s *Scheduler) LeaderInstanceID() string {
-	return s.leader.InstanceID()
-}
-
-// IsLeader 返回当前实例是否为 Leader（供 API /status 端点使用）
-func (s *Scheduler) IsLeader() bool {
-	return s.leader.IsLeader()
+func (s *Scheduler) QueueStats() map[string]any {
+	if q := s.queues.Load(); q != nil {
+		return q.stats()
+	}
+	return nil
 }

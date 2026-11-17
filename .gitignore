@@ -5,15 +5,14 @@
 go-flash-job
 scheduler/scheduler
 executor/executor
-logger/logger
 
 # 配置文件（含密码，不上传）
-config.yaml
+/config.yaml
 
 # 本地文档（面试谈资，不上传）
 wiki.md
 problem.md
-
+test.md
 # 日志和运行时数据
 logs/
 data/
@@ -23,3 +22,10 @@ data/
 .idea/
 
 benchmark/mock_service/__pycache__
+
+benchmark/mock_service/venv
+
+result.jtl
+jmeter.log
+
+report/

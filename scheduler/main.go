@@ -28,18 +28,20 @@ func main() {
 
 	// 2. 使用配置初始化基础设施
 	database.InitRedis(config.AppConfig.Redis)
-	mq.InitKafka(config.AppConfig.Kafka.Brokers)
 	mq.InitRabbitMQ(config.AppConfig.RabbitMQ.URL)
 	defer database.CloseRedis()
-	defer mq.CloseKafka()
 	defer mq.CloseRabbitMQ()
 
 	// 3. 启动 GMP 调度引擎（异步，避免阻塞 HTTP Server 初始化）
 	// Start 内部是 for 循环（选主 + runAsLeader），会阻塞，必须放 goroutine
 	port := config.AppConfig.Server.Port
 	scheduler := core.NewScheduler(port)
-	go scheduler.Start(ctx)
-	defer scheduler.Stop()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scheduler.Start(ctx)
+	}()
+	defer func() { stop(); <-done }()
 
 	// 4. 启动 HTTP API Server（业务方通过 API 提交任务）
 	r := gin.Default()

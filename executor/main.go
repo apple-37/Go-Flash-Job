@@ -3,12 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
-	"go-flash-job/executor/internal/client"
-	"go-flash-job/pkg/config" 
-	"go-flash-job/pkg/database"
-	"go-flash-job/pkg/mq"
 	"os/signal"
 	"syscall"
+
+	"go-flash-job/pkg/config"
+	"go-flash-job/pkg/database"
+	"go-flash-job/pkg/mq"
 )
 
 func main() {
@@ -21,12 +21,10 @@ func main() {
 
 	// 2. 使用配置初始化消息队列
 	database.InitRedis(config.AppConfig.Redis)
-	mq.InitKafka(config.AppConfig.Kafka.Brokers)
 	mq.InitRabbitMQ(config.AppConfig.RabbitMQ.URL)
 	defer database.CloseRedis()
-	defer mq.CloseKafka()
 	defer mq.CloseRabbitMQ()
 
 	// 3. 启动消费者并阻塞主线程
-	client.StartConsumer(ctx)
+	startConsumer(ctx)
 }

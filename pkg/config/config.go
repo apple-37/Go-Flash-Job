@@ -8,11 +8,10 @@ import (
 
 // Config 对应 config.yaml 的结构
 type Config struct {
-	Server   ServerConfig
-	Redis    RedisConfig
-	Kafka    KafkaConfig
-	RabbitMQ RabbitMQConfig
-	Logger   LoggerConfig
+	Server    ServerConfig
+	Redis     RedisConfig
+	Scheduler SchedulerConfig
+	RabbitMQ  RabbitMQConfig
 }
 
 type ServerConfig struct {
@@ -25,19 +24,15 @@ type RedisConfig struct {
 	DB       int
 }
 
-type KafkaConfig struct {
-	Brokers []string
+type SchedulerConfig struct {
+	Workers  int
+	Batch    int
+	Capacity int
+	Strategy string
 }
 
 type RabbitMQConfig struct {
 	URL string
-}
-
-// LoggerConfig 日志文件配置
-type LoggerConfig struct {
-	Dir        string // 日志目录
-	MaxSizeMB  int    // 单文件最大大小（MB）
-	MaxKeepDays int   // 日志保留天数
 }
 
 var AppConfig Config
@@ -60,27 +55,35 @@ func InitConfig() {
 
 	// S1: 默认值规范化
 	if AppConfig.Server.Port == "" {
-		AppConfig.Server.Port = "8080"
+		AppConfig.Server.Port = ":8080"
 	}
 	if AppConfig.Redis.Addr == "" {
 		AppConfig.Redis.Addr = "localhost:6379"
 	}
-	if AppConfig.Logger.Dir == "" {
-		AppConfig.Logger.Dir = "./logs"
-	}
-	if AppConfig.Logger.MaxSizeMB == 0 {
-		AppConfig.Logger.MaxSizeMB = 100
-	}
-	if AppConfig.Logger.MaxKeepDays == 0 {
-		AppConfig.Logger.MaxKeepDays = 7
-	}
-
 	// S1: 关键配置校验（缺失则启动失败，避免运行时才报错）
 	if AppConfig.Redis.Addr == "" {
 		log.Fatalf("❌ 配置校验失败: redis.addr 不能为空")
 	}
-	if len(AppConfig.Kafka.Brokers) == 0 {
-		log.Printf("⚠️ 配置警告: kafka.brokers 为空，日志功能不可用")
+	c := &AppConfig.Scheduler
+	if c.Workers == 0 {
+		c.Workers = 4
+	}
+	if c.Batch == 0 {
+		c.Batch = 16
+	}
+	if c.Capacity == 0 {
+		c.Capacity = 512
+	}
+	if c.Strategy == "" {
+		c.Strategy = "steal"
+	}
+	if c.Workers < 1 || c.Workers > 256 || c.Batch < 1 || c.Batch > 256 || c.Capacity < 1 || c.Capacity > 65536 {
+		log.Fatal("invalid scheduler workers/batch/capacity")
+	}
+	switch c.Strategy {
+	case "shared", "local", "steal":
+	default:
+		log.Fatal("invalid scheduler.strategy")
 	}
 	if AppConfig.RabbitMQ.URL == "" {
 		log.Fatalf("❌ 配置校验失败: rabbitmq.url 不能为空")

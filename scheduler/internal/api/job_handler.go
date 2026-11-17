@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 	"go-flash-job/pkg/model"
 	"go-flash-job/scheduler/internal/service"
@@ -23,6 +22,7 @@ type JobHandler struct {
 type SchedulerStatus interface {
 	LeaderInstanceID() string
 	IsLeader() bool
+	QueueStats() map[string]any
 }
 
 func NewJobHandler(s SchedulerStatus) *JobHandler {
@@ -54,10 +54,11 @@ func RegisterRoutes(r *gin.Engine, s SchedulerStatus) {
 // 监控器连任意实例查 /status，即可发现当前 leader 在哪个地址
 // 解决“监控器写死 8080、换主后无法监控”的问题
 func (h *JobHandler) HandleStatus(c *gin.Context) {
-	leaderID, _ := database.RDB.Get(c, consts.SchedulerLockKey).Result()
+	leaderID, _ := database.RDB.Get(c, database.SchedulerLockKey).Result()
 	c.JSON(http.StatusOK, gin.H{
 		"instance_id": h.scheduler.LeaderInstanceID(),
 		"is_leader":   h.scheduler.IsLeader(),
+		"queues":      h.scheduler.QueueStats(),
 		"leader_id":   leaderID, // 为空说明当前无主（选主中）
 	})
 }
@@ -73,6 +74,10 @@ func (h *JobHandler) HandleSubmit(c *gin.Context) {
 	}
 
 	// 基础校验
+	if task.Timeout < 0 || task.MaxRetry < 0 || task.LatestAt < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid timeout, max_retry or latest_at"})
+		return
+	}
 	if task.ID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "id is required"})
 		return
@@ -87,6 +92,10 @@ func (h *JobHandler) HandleSubmit(c *gin.Context) {
 	}
 
 	if err := h.jobSvc.SubmitJob(c.Request.Context(), &task); err != nil {
+		if err == service.ErrDuplicate {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -122,7 +131,7 @@ func (h *JobHandler) HandleBatchSubmit(c *gin.Context) {
 
 	// URL 校验
 	for i, t := range req.Tasks {
-		if t.ID == "" || t.CallbackURL == "" {
+		if t.Timeout < 0 || t.MaxRetry < 0 || t.LatestAt < 0 || t.ID == "" || t.CallbackURL == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "task id and callback_url are required", "index": i})
 			return
 		}

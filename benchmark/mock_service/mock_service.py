@@ -15,7 +15,7 @@ import time
 import asyncio
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI(title="Mock Business Service")
 
@@ -27,14 +27,13 @@ stats = {
 }
 
 
-@app.post("/run")
+@app.post("/run", status_code=202)
 async def run_task(request: Request):
     """接收 executor 的 HTTP 回调"""
     stats["total"] += 1
 
-    payload = await request.json()
+    await request.body()
     job_id = request.headers.get("X-Job-ID", "unknown")
-    retry = request.headers.get("X-Retry-Count", "0")
 
     # 可选延迟（测试超时）
     delay_ms = int(request.query_params.get("delay_ms", 0))
@@ -46,17 +45,12 @@ async def run_task(request: Request):
     if random.random() < fail_rate:
         stats["failed"] += 1
         return JSONResponse(
-            status_code=500,
+            status_code=429,
             content={"error": "mock failure", "job_id": job_id},
         )
 
     stats["success"] += 1
-    return {
-        "status": "ok",
-        "job_id": job_id,
-        "retry": retry,
-        "payload_size": len(str(payload)),
-    }
+    return Response(status_code=202, headers={"X-Job-ID": job_id})
 
 
 @app.get("/health")

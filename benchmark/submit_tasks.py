@@ -18,14 +18,18 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 
 
+# Fixed before the submitting threads start, so every task has one scheduled instant.
+trigger_at = 0
+run_id = ""
+
 def build_task(callback_url, idx, fail_rate=0.0, delay_ms=0):
     """构造一个任务"""
-    task_id = f"bench_{int(time.time())}_{idx:06d}"
+    task_id = f"bench_{run_id}_{idx:06d}"
     return {
         "id": task_id,
         "name": f"压测任务_{idx}",
         "callback_url": f"{callback_url}/run?fail_rate={fail_rate}&delay_ms={delay_ms}",
-        "trigger_time": 1,  # 1 秒后执行
+        "trigger_time": trigger_at,
         "priority": "Medium",
         "max_retry": 3,
         "timeout": 30,
@@ -56,7 +60,7 @@ def submit_batch(batch_url, callback_url, start_idx, batch_size, fail_rate=0.0, 
     try:
         resp = requests.post(batch_url, json={"tasks": tasks}, timeout=10)
         if resp.status_code == 200:
-            return batch_size
+            return resp.json()["count"]
         else:
             print(f"❌ 批量提交失败 status={resp.status_code} resp={resp.text[:200]}")
             return 0
@@ -77,12 +81,17 @@ def main():
     parser.add_argument("--workers", type=int, default=20, help="并发提交线程数")
     parser.add_argument("--batch-size", type=int, default=100, help="批量模式每批任务数")
     parser.add_argument("--single", action="store_true", help="使用单条接口（默认批量接口）")
+    parser.add_argument("--lead-seconds", type=int, default=15, help="同批任务的共同到期时间距现在的秒数")
     args = parser.parse_args()
+    global trigger_at, run_id
+    trigger_at = int(time.time()) + args.lead_seconds
+    run_id = uuid.uuid4().hex[:12]
+    print(f"run_id={run_id} trigger_at={trigger_at}")
 
     # 自动选择 API 路径
     base = "http://localhost:8080"
     if args.url:
-        base = args.url.rstrip("/submit").rstrip("/batch").rstrip("/")
+        base = args.url.split("/api/v1/")[0].rstrip("/")
     submit_url = f"{base}/api/v1/jobs/submit"
     batch_url = f"{base}/api/v1/jobs/batch"
 

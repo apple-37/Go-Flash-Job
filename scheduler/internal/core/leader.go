@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
-	"go-flash-job/pkg/consts"
 	"go-flash-job/pkg/database"
 
 	"github.com/redis/go-redis/v9"
@@ -44,7 +44,7 @@ var renewScript = redis.NewScript(`
 // 多个 scheduler 实例只有一个能拿到锁成为主，其余 standby 等待接管
 type LeaderElection struct {
 	instanceID string // 唯一标识（hostname:port），用于 CAS 校验和 leader 发现
-	isLeader   bool
+	isLeader   atomic.Bool
 }
 
 // NewLeaderElection 创建选主实例
@@ -85,7 +85,7 @@ func (le *LeaderElection) WaitForLeadership(ctx context.Context) (<-chan struct{
 		}
 
 		if acquired {
-			le.isLeader = true
+			le.isLeader.Store(true)
 			log.Printf("👑 [%s] 已成为 Leader，开始调度", le.instanceID)
 			lostCh := make(chan struct{})
 			go le.renewLoop(ctx, lostCh)
@@ -104,7 +104,7 @@ func (le *LeaderElection) WaitForLeadership(ctx context.Context) (<-chan struct{
 
 // tryAcquire 尝试获取锁（SET NX EX）
 func (le *LeaderElection) tryAcquire(ctx context.Context) (bool, error) {
-	ok, err := database.RDB.SetNX(ctx, consts.SchedulerLockKey, le.instanceID, lockTTL).Result()
+	ok, err := database.RDB.SetNX(ctx, database.SchedulerLockKey, le.instanceID, lockTTL).Result()
 	if err != nil {
 		return false, err
 	}
@@ -120,17 +120,20 @@ func (le *LeaderElection) renewLoop(ctx context.Context, lostCh chan struct{}) {
 	for {
 		select {
 		case <-ctx.Done():
-			le.isLeader = false
+			releaseCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			le.Release(releaseCtx)
+			cancel()
+			le.isLeader.Store(false)
 			close(lostCh)
 			return
 		case <-ticker.C:
 		}
 
 		ok, err := renewScript.Run(ctx, database.RDB,
-			[]string{consts.SchedulerLockKey},
+			[]string{database.SchedulerLockKey},
 			le.instanceID, int(lockTTL/time.Second)).Int64()
 		if err != nil || ok == 0 {
-			le.isLeader = false
+			le.isLeader.Store(false)
 			log.Printf("⚠️ [%s] 续期失败（err=%v, ok=%d），让出 Leader 身份", le.instanceID, err, ok)
 			close(lostCh)
 			return
@@ -141,20 +144,20 @@ func (le *LeaderElection) renewLoop(ctx context.Context, lostCh chan struct{}) {
 // Release 释放锁（优雅退出时调用）
 // 用 CAS 脚本，避免误删别人的锁
 func (le *LeaderElection) Release(ctx context.Context) {
-	if !le.isLeader {
+	if !le.isLeader.Load() {
 		return
 	}
 	_, err := releaseScript.Run(ctx, database.RDB,
-		[]string{consts.SchedulerLockKey}, le.instanceID).Int64()
+		[]string{database.SchedulerLockKey}, le.instanceID).Int64()
 	if err != nil {
 		log.Printf("⚠️ 释放锁失败: %v", err)
 		return
 	}
-	le.isLeader = false
+	le.isLeader.Store(false)
 	log.Printf("🔓 [%s] 已释放 Leader 锁", le.instanceID)
 }
 
 // IsLeader 返回当前是否为主
 func (le *LeaderElection) IsLeader() bool {
-	return le.isLeader
+	return le.isLeader.Load()
 }

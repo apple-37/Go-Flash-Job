@@ -8,14 +8,11 @@ redis:
   password: ""
   db: 0
 
-kafka:
-  brokers:
-    - "127.0.0.1:9092"
+scheduler:
+  workers: 4
+  batch: 16
+  capacity: 512
+  strategy: steal  # shared | local | steal
 
 rabbitmq:
   url: "amqp://user:password@localhost:5672/"
-
-logger:
-  dir: "./logs"
-  max_size_mb: 100
-  max_keep_days: 7
