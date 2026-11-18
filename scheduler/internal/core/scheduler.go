@@ -138,15 +138,17 @@ func (s *Scheduler) run(ctx context.Context) {
 			}
 			nextMaintenance = now.Add(time.Second)
 		}
-		limit := min(128, q.space())
+		reserved := q.reserve(config.AppConfig.Scheduler.FetchBatch)
+		limit := len(reserved.owners)
 		if limit > 0 {
 			token := rand.Text()
 			keys := []string{database.JobZSetKey, database.JobPendingZSetKey, database.SchedulerLockKey, database.ActiveTasksKey, database.TerminalTasksKey, database.JobDeadZSetKey}
 			rows, err := claimDue.Run(ctx, database.RDB, keys, now.Unix(), limit, token, database.TaskStateKeyPrefix, database.TaskDetailKeyPrefix, s.leader.InstanceID(), database.DeadDetailKeyPrefix).StringSlice()
 			if err != nil {
 				log.Print(err)
-			} else if len(rows) > 0 {
-				var batch []delivery
+			}
+			var batch []delivery
+			if err == nil && ctx.Err() == nil {
 				for i := 0; i+1 < len(rows); i += 2 {
 					var t model.Task
 					if err := json.Unmarshal([]byte(rows[i+1]), &t); err != nil || t.ID != rows[i] {
@@ -155,10 +157,10 @@ func (s *Scheduler) run(ctx context.Context) {
 					}
 					batch = append(batch, delivery{task: t, claim: token})
 				}
-				q.push(batch)
-				if len(rows) == 2*limit {
-					continue
-				}
+			}
+			reserved.complete(batch)
+			if err == nil && len(rows) == 2*limit {
+				continue
 			}
 		}
 		select {

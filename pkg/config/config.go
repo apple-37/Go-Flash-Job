@@ -25,10 +25,9 @@ type RedisConfig struct {
 }
 
 type SchedulerConfig struct {
-	Workers  int
-	Batch    int
-	Capacity int
-	Strategy string
+	Workers       int
+	FetchBatch    int `mapstructure:"fetch_batch"`
+	LocalCapacity int `mapstructure:"local_capacity"`
 }
 
 type RabbitMQConfig struct {
@@ -68,22 +67,27 @@ func InitConfig() {
 	if c.Workers == 0 {
 		c.Workers = 4
 	}
-	if c.Batch == 0 {
-		c.Batch = 16
+	if c.FetchBatch == 0 {
+		c.FetchBatch = 128
 	}
-	if c.Capacity == 0 {
-		c.Capacity = 512
+	if !viper.IsSet("scheduler.local_capacity") && viper.IsSet("scheduler.capacity") {
+		// Earlier versions used one total global capacity. Preserve approximately
+		// that queued-task budget when loading an existing local configuration.
+		oldCapacity := viper.GetInt("scheduler.capacity")
+		if oldCapacity < 1 || oldCapacity > 65536 || c.Workers < 1 {
+			log.Fatal("invalid legacy scheduler.capacity or workers")
+		}
+		c.LocalCapacity = (oldCapacity + c.Workers - 1) / c.Workers
+		log.Print("scheduler.capacity migrated to per-P local_capacity; update config.yaml using config.example.yaml")
 	}
-	if c.Strategy == "" {
-		c.Strategy = "steal"
+	if c.LocalCapacity == 0 {
+		c.LocalCapacity = 128
 	}
-	if c.Workers < 1 || c.Workers > 256 || c.Batch < 1 || c.Batch > 256 || c.Capacity < 1 || c.Capacity > 65536 {
-		log.Fatal("invalid scheduler workers/batch/capacity")
+	if c.Workers < 1 || c.Workers > 256 || c.FetchBatch < 1 || c.FetchBatch > 256 || c.LocalCapacity < 1 || c.LocalCapacity > 65536 {
+		log.Fatal("invalid scheduler workers/fetch_batch/local_capacity")
 	}
-	switch c.Strategy {
-	case "shared", "local", "steal":
-	default:
-		log.Fatal("invalid scheduler.strategy")
+	if viper.IsSet("scheduler.batch") || viper.IsSet("scheduler.strategy") {
+		log.Print("scheduler.batch and scheduler.strategy are retired; using round-robin dispatch with work stealing")
 	}
 	if AppConfig.RabbitMQ.URL == "" {
 		log.Fatalf("❌ 配置校验失败: rabbitmq.url 不能为空")

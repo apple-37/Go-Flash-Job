@@ -1,4 +1,4 @@
-# 文件: configs/config.example.yaml
+# 文件: config.example.yaml
 
 server:
   port: ":8080"
@@ -10,9 +10,8 @@ redis:
 
 scheduler:
   workers: 4
-  batch: 16
-  capacity: 512
-  strategy: steal  # shared | local | steal
+  fetch_batch: 128     # 一次 Redis 领取的上限
+  local_capacity: 128  # 每个 P 的待发布队列上限
 
 rabbitmq:
   url: "amqp://user:password@localhost:5672/"
