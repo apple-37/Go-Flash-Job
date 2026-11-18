@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,21 +20,27 @@ import (
 	"go-flash-job/pkg/mq"
 )
 
-// The pending score is the lease deadline. A claim token fences late confirms.
+const preloadWindow = 5 * time.Minute
+
+// Pending expires after the scheduled time, including the prefetch residence.
+// ARGV[1] is now; ARGV[8] is the upper bound of the five-minute window.
 var claimDue = redis.NewScript(`
  if redis.call('GET',KEYS[3]) ~= ARGV[6] then return {} end
- local ids=redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',ARGV[1],'LIMIT',0,ARGV[2])
+ local entries=redis.call('ZRANGEBYSCORE',KEYS[1],'-inf',ARGV[8],'WITHSCORES','LIMIT',0,ARGV[2])
  local result={}
- for _,id in ipairs(ids) do
+ for i=1,#entries,2 do
+  local id=entries[i]
+  local due=tonumber(entries[i+1])
   local state=ARGV[4]..':'..id
   local data=redis.call('HGET',ARGV[5]..':'..id,'data')
   local valid,task=false,nil
   if data then valid,task=pcall(cjson.decode,data) end
   if valid and type(task)=='table' and task.id==id then
    redis.call('HSET',state,'status','READY','claim',ARGV[3],'retry_count',task.retry_count or 0)
-   redis.call('ZADD',KEYS[2],ARGV[1]+60,id)
+   redis.call('ZADD',KEYS[2],math.max(tonumber(ARGV[1]),due)+60,id)
    table.insert(result,id)
    table.insert(result,data)
+   table.insert(result,entries[i+1])
   else
    redis.call('HSET',state,'status','DEAD','error','invalid or missing task detail')
    redis.call('ZREM',KEYS[4],id)
@@ -143,23 +150,30 @@ func (s *Scheduler) run(ctx context.Context) {
 		if limit > 0 {
 			token := rand.Text()
 			keys := []string{database.JobZSetKey, database.JobPendingZSetKey, database.SchedulerLockKey, database.ActiveTasksKey, database.TerminalTasksKey, database.JobDeadZSetKey}
-			rows, err := claimDue.Run(ctx, database.RDB, keys, now.Unix(), limit, token, database.TaskStateKeyPrefix, database.TaskDetailKeyPrefix, s.leader.InstanceID(), database.DeadDetailKeyPrefix).StringSlice()
+			rows, err := claimDue.Run(ctx, database.RDB, keys, now.Unix(), limit, token, database.TaskStateKeyPrefix, database.TaskDetailKeyPrefix, s.leader.InstanceID(), database.DeadDetailKeyPrefix, now.Add(preloadWindow).Unix()).StringSlice()
 			if err != nil {
 				log.Print(err)
 			}
 			var batch []delivery
 			if err == nil && ctx.Err() == nil {
-				for i := 0; i+1 < len(rows); i += 2 {
+				for i := 0; i+2 < len(rows); i += 3 {
 					var t model.Task
 					if err := json.Unmarshal([]byte(rows[i+1]), &t); err != nil || t.ID != rows[i] {
 						log.Printf("invalid task detail id=%q", rows[i])
 						continue
 					}
+					// The sorted-set score includes retry rescheduling and recovery.
+					due, err := strconv.ParseInt(rows[i+2], 10, 64)
+					if err != nil {
+						log.Printf("invalid schedule id=%q: %v", t.ID, err)
+						continue
+					}
+					t.TriggerTime = due
 					batch = append(batch, delivery{task: t, claim: token})
 				}
 			}
 			reserved.complete(batch)
-			if err == nil && len(rows) == 2*limit {
+			if err == nil && len(rows) == 3*limit {
 				continue
 			}
 		}

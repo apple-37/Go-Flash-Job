@@ -10,7 +10,7 @@ type Task struct {
 	Name        string          `json:"name"`                // 任务名称
 	CallbackURL string          `json:"callback_url"`        // 业务方服务地址，executor 会 HTTP POST 调用
 	TriggerTime int64           `json:"trigger_time"`        // 触发时间戳（秒）
-	Priority    string          `json:"priority"`            // 兼容提交字段；就绪队列使用 FIFO
+	Priority    string          `json:"priority"`            // 兼容提交字段；本地最小堆按触发时间排序
 	RetryCount  int             `json:"retry_count"`         // 已重试次数
 	MaxRetry    int             `json:"max_retry"`           // 最大重试次数
 	Timeout     int             `json:"timeout"`             // 执行超时（秒）

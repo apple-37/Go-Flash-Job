@@ -19,6 +19,87 @@ func deliveries(start, count int) []delivery {
 	return items
 }
 
+func TestHeapWaitsUntilScheduledTime(t *testing.T) {
+	q := newQueues(config.SchedulerConfig{Workers: 1, LocalCapacity: 4})
+	defer q.close()
+	tasks := deliveries(0, 3)
+	for i, due := range []int64{300, 100, 200} {
+		tasks[i].task.TriggerTime = due
+	}
+	q.reserve(3).complete(tasks)
+	if _, ok, wait := q.local[0].popDue(time.Unix(99, 500000000)); ok || wait != 500*time.Millisecond {
+		t.Fatalf("early dispatch or inaccurate wait: ok=%v wait=%v", ok, wait)
+	}
+	for _, due := range []int64{100, 200, 300} {
+		d, ok, _ := q.local[0].popDue(time.Unix(due, 0))
+		if !ok || d.task.TriggerTime != due {
+			t.Fatalf("heap order: %v", d)
+		}
+	}
+}
+
+func TestStolenFutureTasksStayInHeap(t *testing.T) {
+	q := newQueues(config.SchedulerConfig{Workers: 2, LocalCapacity: 4})
+	defer q.close()
+	tasks := deliveries(0, 8)
+	for i := range tasks {
+		tasks[i].task.TriggerTime = int64(100 + i)
+	}
+	q.reserve(8).complete(tasks)
+	for i := 0; i < 4; i++ {
+		q.local[0].popDue(time.Unix(200, 0))
+	}
+	if !q.steal(0) {
+		t.Fatal("no transfer")
+	}
+	if got := q.stats()["local_depths"]; !reflect.DeepEqual(got, []int{2, 2}) {
+		t.Fatal(got)
+	}
+	if _, ok, _ := q.local[0].popDue(time.Unix(100, 0)); ok {
+		t.Fatal("stolen task published early")
+	}
+	for _, due := range []int64{101, 103} {
+		d, ok, _ := q.local[0].popDue(time.Unix(due, 0))
+		if !ok || d.task.TriggerTime != due {
+			t.Fatalf("receiver heap: %v", d)
+		}
+	}
+	for _, due := range []int64{105, 107} {
+		d, ok, _ := q.local[1].popDue(time.Unix(due, 0))
+		if !ok || d.task.TriggerTime != due {
+			t.Fatalf("victim heap: %v", d)
+		}
+	}
+}
+
+func TestEarlierTaskInterruptsTimer(t *testing.T) {
+	q := newQueues(config.SchedulerConfig{Workers: 1, LocalCapacity: 4})
+	defer q.close()
+	future := deliveries(0, 1)
+	future[0].task.TriggerTime = time.Now().Add(time.Hour).Unix()
+	q.reserve(1).complete(future)
+	result := make(chan delivery, 1)
+	go func() {
+		if d, ok := q.take(0); ok {
+			result <- d
+		}
+	}()
+	select {
+	case <-result:
+		t.Fatal("future task published early")
+	case <-time.After(20 * time.Millisecond):
+	}
+	q.reserve(1).complete(deliveries(1, 1))
+	select {
+	case d := <-result:
+		if d.task.ID != "1" {
+			t.Fatalf("returned %s", d.task.ID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("earlier head did not interrupt timer")
+	}
+}
+
 func TestRoundRobinAcrossSmallBatches(t *testing.T) {
 	q := newQueues(config.SchedulerConfig{Workers: 3, LocalCapacity: 4})
 	defer q.close()
@@ -31,7 +112,7 @@ func TestRoundRobinAcrossSmallBatches(t *testing.T) {
 	}
 	for id := range q.local {
 		for _, want := range []string{fmt.Sprint(id), fmt.Sprint(id + 3)} {
-			got, ok := q.local[id].pop()
+			got, ok, _ := q.local[id].popDue(time.Now())
 			if !ok || got.task.ID != want {
 				t.Fatalf("P%d got %v, want %s", id, got, want)
 			}
@@ -50,7 +131,7 @@ func TestRoundRobinSkipsFullQueues(t *testing.T) {
 	if n := len(q.reserve(1).owners); n != 0 {
 		t.Fatalf("full queues reserved %d", n)
 	}
-	q.local[1].pop()
+	q.local[1].popDue(time.Now())
 	r = q.reserve(10)
 	if !reflect.DeepEqual(r.owners, []int{1}) {
 		t.Fatalf("unexpected assignment %v", r.owners)
@@ -81,27 +162,19 @@ func TestRoundRobinAdvancesByActualRead(t *testing.T) {
 func TestReservationProtectsSpaceDuringStealing(t *testing.T) {
 	q := newQueues(config.SchedulerConfig{Workers: 2, LocalCapacity: 4})
 	defer q.close()
-	r := q.reserve(8)
-	r.complete(deliveries(0, 8))
+	q.reserve(8).complete(deliveries(0, 8))
 	for i := 0; i < 4; i++ {
-		q.local[0].pop()
+		q.local[0].popDue(time.Now())
 	}
 	inFlight := q.reserve(4)
-	// P0's free space is reserved for the Redis read, so it may execute one
-	// stolen task but cannot fill its queue with additional stolen entries.
-	got, ok := q.steal(0)
-	if !ok || got.task.ID != "7" {
-		t.Fatalf("unexpected steal %v, %v", got, ok)
+	if q.steal(0) {
+		t.Fatal("stealing consumed reserved heap capacity")
 	}
 	inFlight.complete(deliveries(8, 4))
-	if got := q.stats()["local_depths"]; !reflect.DeepEqual(got, []int{4, 3}) {
-		t.Fatal(got)
-	}
-	if got := q.stolenTasks.Load(); got != 1 {
+	if got := q.stats()["local_depths"]; !reflect.DeepEqual(got, []int{4, 4}) {
 		t.Fatal(got)
 	}
 }
-
 func TestShortReadReleasesUnusedReservation(t *testing.T) {
 	q := newQueues(config.SchedulerConfig{Workers: 2, LocalCapacity: 4})
 	defer q.close()

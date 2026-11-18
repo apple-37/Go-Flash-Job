@@ -1,8 +1,10 @@
 package core
 
 import (
+	"container/heap"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go-flash-job/pkg/config"
 	"go-flash-job/pkg/model"
@@ -13,23 +15,49 @@ type delivery struct {
 	claim string
 }
 
+// taskHeap orders prefetched tasks by their scheduled time, then submission time.
+type taskHeap []delivery
+
+func (h taskHeap) Len() int { return len(h) }
+func (h taskHeap) Less(i, j int) bool {
+	if h[i].task.TriggerTime != h[j].task.TriggerTime {
+		return h[i].task.TriggerTime < h[j].task.TriggerTime
+	}
+	if h[i].task.EnqueueAt != h[j].task.EnqueueAt {
+		return h[i].task.EnqueueAt < h[j].task.EnqueueAt
+	}
+	return h[i].task.ID < h[j].task.ID
+}
+func (h taskHeap) Swap(i, j int)   { h[i], h[j] = h[j], h[i] }
+func (h *taskHeap) Push(value any) { *h = append(*h, value.(delivery)) }
+func (h *taskHeap) Pop() any {
+	last := len(*h) - 1
+	d := (*h)[last]
+	(*h)[last] = delivery{}
+	*h = (*h)[:last]
+	return d
+}
+
 type localQueue struct {
 	mu       sync.Mutex
-	items    []delivery
+	items    taskHeap
 	reserved int // Slots promised to the one Fetcher, including its in-flight Redis read.
 	wake     chan struct{}
 }
 
-func (q *localQueue) pop() (delivery, bool) {
+// A negative wait means empty; a positive wait is time until the heap head is due.
+// Inspecting the head and popping it share one lock, including during stealing.
+func (q *localQueue) popDue(now time.Time) (delivery, bool, time.Duration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.items) == 0 {
-		return delivery{}, false
+		return delivery{}, false, -1
 	}
-	d := q.items[0]
-	q.items[0] = delivery{}
-	q.items = q.items[1:]
-	return d, true
+	wait := time.Unix(q.items[0].task.TriggerTime, 0).Sub(now)
+	if wait > 0 {
+		return delivery{}, false, wait
+	}
+	return heap.Pop(&q.items).(delivery), true, 0
 }
 
 // Only reservation planning and stealing share dispatchMu. The local pop path
@@ -125,6 +153,7 @@ func (r *reservation) complete(tasks []delivery) {
 		p.reserved -= count
 		if !q.closed.Load() {
 			p.items = append(p.items, groups[i]...)
+			heap.Init(&p.items)
 			inserted += len(groups[i])
 		}
 		p.mu.Unlock()
@@ -147,57 +176,71 @@ func (r *reservation) complete(tasks []delivery) {
 	}
 }
 
-func (q *readyQueues) steal(id int) (delivery, bool) {
+// Transfer earliest tasks using heap.Pop. The receiver still checks their due
+// times in take; a successful steal never grants permission to publish early.
+func (q *readyQueues) steal(id int) bool {
 	q.dispatchMu.Lock()
 	defer q.dispatchMu.Unlock()
 	own := &q.local[id]
 	own.mu.Lock()
 	defer own.mu.Unlock()
 	if q.closed.Load() {
-		return delivery{}, false
+		return false
 	}
 	// A producer may have filled this queue after take's first local check.
 	if len(own.items) > 0 {
-		d := own.items[0]
-		own.items[0] = delivery{}
-		own.items = own.items[1:]
-		return d, true
+		return true
 	}
 	for offset := 1; offset < len(q.local); offset++ {
 		victim := &q.local[(id+offset)%len(q.local)]
 		victim.mu.Lock()
-		// One stolen task is returned directly; only the remainder occupies space.
-		n := min((len(victim.items)+1)/2, q.capacity-own.reserved+1)
+		// Leave one task with the owner so a lone future timer cannot bounce
+		// between otherwise empty workers. All stolen tasks occupy heap space.
+		n := min(len(victim.items)/2, q.capacity-own.reserved)
 		if n == 0 {
 			victim.mu.Unlock()
 			continue
 		}
-		split := len(victim.items) - n
-		d := victim.items[split]
-		own.items = append(own.items, victim.items[split+1:]...)
-		clear(victim.items[split:])
-		victim.items = victim.items[:split]
+		for i := 0; i < n; i++ {
+			own.items = append(own.items, heap.Pop(&victim.items).(delivery))
+		}
+		heap.Init(&own.items)
 		victim.mu.Unlock()
+		select {
+		case victim.wake <- struct{}{}:
+		default:
+		}
 		q.steals.Add(1)
 		q.stolenTasks.Add(int64(n))
-		return d, true
+		return true
 	}
-	return delivery{}, false
+	return false
 }
 
 func (q *readyQueues) take(id int) (delivery, bool) {
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
 	for !q.closed.Load() {
-		if d, ok := q.local[id].pop(); ok {
+		d, ok, wait := q.local[id].popDue(time.Now())
+		if ok {
 			return d, true
 		}
-		if d, ok := q.steal(id); ok {
-			return d, true
+		if wait < 0 && q.steal(id) {
+			continue
+		}
+		var deadline <-chan time.Time
+		if wait > 0 {
+			timer.Reset(wait)
+			deadline = timer.C
 		}
 		select {
 		case <-q.stop:
 			return delivery{}, false
 		case <-q.local[id].wake:
+		case <-deadline:
 		}
+		timer.Stop()
 	}
 	return delivery{}, false
 }
@@ -217,7 +260,7 @@ func (q *readyQueues) stats() map[string]any {
 		p.mu.Unlock()
 	}
 	return map[string]any{
-		"strategy": "round_robin_steal", "local_capacity": q.capacity,
+		"strategy": "round_robin_heap_steal", "preload_seconds": int64(preloadWindow / time.Second), "local_capacity": q.capacity,
 		"local_depths": depths, "reserved_slots": reserved,
 		"dispatch_batches": q.batches.Load(), "dispatched_tasks": q.dispatched.Load(),
 		"steals": q.steals.Load(), "stolen_tasks": q.stolenTasks.Load(),
